@@ -1,0 +1,33 @@
+export const INGRESS_REGISTRY_ABI = [
+  "function MAX_SESSION_SECONDS() view returns (uint256)",
+  "function SESSION_PRUNE_DELAY() view returns (uint256)",
+  "function quoteSigner() view returns (address)",
+  "function setAssetConfig(address asset,bool accepted)",
+  "function fundWithAssetQuote((bytes32 quoteId,bytes32 sessionId,address developer,address asset,uint256 amount,uint256 minAmount,uint256 maxAmount,uint256 paidSeconds,uint256 serviceAmount,uint256 setupFee,uint256 validationFeeCap,bytes32 jobId,address expectedJobSigner,bytes32 operatorId,bytes32 processorId,bytes32 endpointHash,bytes32 salt,address operatorRecipient,address validatorRecipient,address proofRecipient,uint16 maxOperatorBps,uint16 maxValidatorBps,uint16 maxProofBps,bytes32 policyHash,uint256 deadline) q, bytes signature)",
+  "function hashQuote((bytes32 quoteId,bytes32 sessionId,address developer,address asset,uint256 amount,uint256 minAmount,uint256 maxAmount,uint256 paidSeconds,uint256 serviceAmount,uint256 setupFee,uint256 validationFeeCap,bytes32 jobId,address expectedJobSigner,bytes32 operatorId,bytes32 processorId,bytes32 endpointHash,bytes32 salt,address operatorRecipient,address validatorRecipient,address proofRecipient,uint16 maxOperatorBps,uint16 maxValidatorBps,uint16 maxProofBps,bytes32 policyHash,uint256 deadline) q) view returns (bytes32)",
+  "function activateSession(bytes32 sessionId)",
+  "function recordFulfillment((bytes32 sessionId,bytes32 epochId,uint256 periodStart,uint256 periodEnd,address operatorRecipient,address validatorRecipient,address proofRecipient,uint256 operatorAmount,uint256 validatorAmount,uint256 proofAmount,bytes32 reportRoot,bytes32 policyHash,bytes32 validatorSetHash,uint8 result) f)",
+  "function recordFulfillments((bytes32 sessionId,bytes32 epochId,uint256 periodStart,uint256 periodEnd,address operatorRecipient,address validatorRecipient,address proofRecipient,uint256 operatorAmount,uint256 validatorAmount,uint256 proofAmount,bytes32 reportRoot,bytes32 policyHash,bytes32 validatorSetHash,uint8 result)[] fulfillments)",
+  "function recordWorkFees((bytes32 sessionId,bytes32 feeId,address proofRecipient,address validatorRecipient,uint256 setupFeeAmount,uint256 validationFeeAmount,bytes32 evidenceHash,bytes32 policyHash,bytes32 validatorSetHash) w)",
+  "function refundAfterActivationTimeout(bytes32 sessionId)",
+  "function refundUnfulfilled(bytes32 sessionId)",
+  "function refundAvailableAt(bytes32 sessionId) view returns (uint256)",
+  "function pruneSession(bytes32 sessionId)",
+  "function prunedSessions(bytes32 sessionId) view returns (bool)",
+  "function claim(address asset)",
+  "function claimableBalances(address asset,address recipient) view returns (uint256)",
+  "function getSession(bytes32 sessionId) view returns ((address developer,address asset,uint256 amountPaid,uint256 serviceAmount,uint256 setupFee,uint256 validationFeeCap,uint256 pricePerSecond,uint256 paidSeconds,uint256 expiresAt,bytes32 quoteId,bytes32 policyHash,bytes32 jobId,address expectedJobSigner,bytes32 operatorId,bytes32 processorId,bytes32 endpointHash,bytes32 salt,address operatorRecipient,address validatorRecipient,address proofRecipient,uint16 maxOperatorBps,uint16 maxValidatorBps,uint16 maxProofBps,bool registered,uint256 nextNonce,uint256 activatedAt,uint256 activationDeadline,uint256 fulfilledUntil,uint256 amountReleased,uint256 amountAccounted,uint256 setupFeeReleased,uint256 validationFeeReleased,uint256 amountRefunded,uint8 status))",
+  "event SessionFunded(bytes32 indexed sessionId,address indexed payer,address indexed asset,uint256 amount,uint256 secondsPurchased,uint256 expiresAt)",
+  "event SessionFundedWithQuote(bytes32 indexed sessionId,bytes32 indexed quoteId,bytes32 indexed policyHash,uint256 serviceAmount,uint256 setupFee,uint256 validationFeeCap,uint256 amountPaid,uint256 paidSeconds)",
+  "event IngressRegistered(bytes32 indexed sessionId,address indexed jobSigner,bytes32 indexed operatorId,bytes32 processorId)",
+  "event SessionActivated(bytes32 indexed sessionId,uint256 activatedAt,uint256 expiresAt)",
+  "event FulfillmentRecorded(bytes32 indexed sessionId,bytes32 indexed epochId,uint8 result,uint256 periodStart,uint256 periodEnd,uint256 operatorAmount,uint256 validatorAmount,uint256 proofAmount,bytes32 reportRoot,bytes32 policyHash,bytes32 validatorSetHash)",
+  "event FulfillmentBatchRecorded(bytes32 indexed batchId,address indexed recorder,uint256 count,bytes32 batchRoot)",
+  "event WorkFeesRecorded(bytes32 indexed sessionId,bytes32 indexed feeId,uint256 setupFeeAmount,uint256 validationFeeAmount,bytes32 evidenceHash,bytes32 policyHash,bytes32 validatorSetHash)",
+  "event ClaimableBalanceIncreased(address indexed asset,address indexed recipient,uint256 amount)",
+  "event Claimed(address indexed asset,address indexed recipient,uint256 amount)",
+  "event SessionRefunded(bytes32 indexed sessionId,address indexed recipient,address indexed asset,uint256 amount,uint8 reason)",
+  "event SessionPruned(bytes32 indexed sessionId,address indexed developer,address indexed asset,uint256 prunedAt)"
+] as const;
+
+export const INGRESS_REGISTRY_NATIVE_PAYMENT_ABI = INGRESS_REGISTRY_ABI;

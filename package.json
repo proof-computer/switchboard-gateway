@@ -1,0 +1,48 @@
+{
+  "name": "switchboard-gateway",
+  "version": "0.1.0",
+  "description": "Switchboard gateway runtime for gateway-agent and hub-watcher.",
+  "private": false,
+  "type": "module",
+  "packageManager": "npm@11.6.2",
+  "main": "dist/gateway-agent.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/proof-computer/switchboard-gateway.git"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/**/*.test.ts",
+    "verify:public-surface": "node scripts/verify-public-surface.mjs",
+    "gateway:agent": "node dist/gateway-agent.js",
+    "gateway:hub-watcher": "node dist/hub-watcher.js",
+    "operator:gateway-agent": "npm run gateway:agent",
+    "operator:hub-watcher": "npm run gateway:hub-watcher",
+    "dev:gateway-agent": "tsx src/gateway-agent.ts",
+    "dev:hub-watcher": "tsx src/hub-watcher.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "assets",
+    "dist",
+    "README.md"
+  ],
+  "dependencies": {
+    "@polkadot/api": "^16.5.6",
+    "@polkadot/keyring": "^14.0.3",
+    "@polkadot/util": "^14.0.3",
+    "@polkadot/util-crypto": "^14.0.3",
+    "ethers": "^6.15.0",
+    "fastify": "^5.6.2",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "license": "UNLICENSED"
+}

@@ -1,0 +1,17 @@
+node:
+  id: switchboard-operator-gateway
+  cluster: switchboard-operator
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path: /var/lib/switchboard/xds/lds.json
+  cds_config:
+    resource_api_version: V3
+    path: /var/lib/switchboard/xds/cds.json

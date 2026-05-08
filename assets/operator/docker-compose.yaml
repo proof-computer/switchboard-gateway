@@ -1,0 +1,167 @@
+name: switchboard-operator
+
+services:
+  envoy:
+    image: ${ENVOY_IMAGE:-envoyproxy/envoy:v1.35-latest}
+    command:
+      - envoy
+      - -c
+      - /etc/envoy/envoy.yaml
+      - --log-level
+      - ${ENVOY_LOG_LEVEL:-info}
+    ports:
+      - "${PUBLIC_HTTPS_PORT:-443}:10000/tcp"
+      - "127.0.0.1:${ENVOY_ADMIN_PORT:-9901}:9901/tcp"
+    volumes:
+      - xds-state:/var/lib/switchboard/xds:ro
+      - ./docker/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      gateway-agent:
+        condition: service_started
+      victoria-metrics:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - operator
+
+  victoria-metrics:
+    image: ${VICTORIA_METRICS_IMAGE:-victoriametrics/victoria-metrics:latest}
+    command:
+      - -promscrape.config=/etc/victoria-metrics/promscrape.yml
+      - -retentionPeriod=${VICTORIA_METRICS_RETENTION:-30d}
+    ports:
+      - "127.0.0.1:${VICTORIA_METRICS_PORT:-8428}:8428/tcp"
+    volumes:
+      - victoria-metrics-data:/victoria-metrics-data
+      - ./docker/victoria-metrics/promscrape.yml:/etc/victoria-metrics/promscrape.yml:ro
+    restart: unless-stopped
+    networks:
+      - operator
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana-oss:latest}
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000/tcp"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      victoria-metrics:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - operator
+
+  gateway-agent:
+    image: ${GATEWAY_AGENT_IMAGE:-ghcr.io/proof-computer/switchboard-gateway/gateway:latest}
+    command:
+      - npm
+      - run
+      - gateway:agent
+    environment:
+      GATEWAY_ID: ${GATEWAY_ID:-}
+      OPERATOR_ID: ${OPERATOR_ID:-}
+      OPERATOR_REPORT_SEED: ${OPERATOR_REPORT_SEED:-}
+      OPERATOR_REPORT_SS58_FORMAT: ${OPERATOR_REPORT_SS58_FORMAT:-42}
+      PROOF_OPERATOR_CAPABILITY_URL: ${PROOF_OPERATOR_CAPABILITY_URL:-}
+      PROOF_OPERATOR_CAPABILITY_TOKEN: ${PROOF_OPERATOR_CAPABILITY_TOKEN:-}
+      OPERATOR_CAPABILITY_REPORT_INTERVAL_MS: ${OPERATOR_CAPABILITY_REPORT_INTERVAL_MS:-60000}
+      OPERATOR_CAPABILITY_REPORT_TTL_SECONDS: ${OPERATOR_CAPABILITY_REPORT_TTL_SECONDS:-180}
+      GATEWAY_AGENT_ROUTE_INTENT_URL: ${GATEWAY_AGENT_ROUTE_INTENT_URL:-}
+      GATEWAY_AGENT_ROUTE_INTENT_TOKEN: ${GATEWAY_AGENT_ROUTE_INTENT_TOKEN:-}
+      GATEWAY_ROUTE_STATE_URL: ${GATEWAY_ROUTE_STATE_URL:-}
+      GATEWAY_ROUTE_STATE_TOKEN: ${GATEWAY_ROUTE_STATE_TOKEN:-}
+      GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS: ${GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS:-5000}
+      GATEWAY_ROUTE_STATE_TIMEOUT_MS: ${GATEWAY_ROUTE_STATE_TIMEOUT_MS:-5000}
+      GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS: ${GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS:-15000}
+      GATEWAY_ROUTE_CAPACITY: ${GATEWAY_ROUTE_CAPACITY:-500}
+      OPERATOR_PUBLIC_ADDRESSES: ${OPERATOR_PUBLIC_ADDRESSES:-}
+      OPERATOR_PUBLIC_ADDRESS_MODE: ${OPERATOR_PUBLIC_ADDRESS_MODE:-}
+      OPERATOR_WAN_IP_URL: ${OPERATOR_WAN_IP_URL:-https://ifconfig.me/ip}
+      OPERATOR_WAN_IP_POLL_INTERVAL_MS: ${OPERATOR_WAN_IP_POLL_INTERVAL_MS:-60000}
+      OPERATOR_WAN_IP_TIMEOUT_MS: ${OPERATOR_WAN_IP_TIMEOUT_MS:-5000}
+      OPERATOR_VALIDATION_HOSTNAME: ${OPERATOR_VALIDATION_HOSTNAME:-}
+      OPERATOR_SUPPORTED_CLASSES: ${OPERATOR_SUPPORTED_CLASSES:-node-webserver}
+      OPERATOR_PROCESSORS: ${OPERATOR_PROCESSORS:-}
+      OPERATOR_MANAGER_IDS: ${OPERATOR_MANAGER_IDS:-}
+      OPERATOR_EXCLUDED_PROCESSORS: ${OPERATOR_EXCLUDED_PROCESSORS:-}
+      OPERATOR_PROCESSOR_DISCOVERY_ENABLED: ${OPERATOR_PROCESSOR_DISCOVERY_ENABLED:-true}
+      OPERATOR_PROCESSOR_DISCOVERY_INTERVAL_MS: ${OPERATOR_PROCESSOR_DISCOVERY_INTERVAL_MS:-60000}
+      OPERATOR_PROCESSOR_MAX_AGE_SECONDS: ${OPERATOR_PROCESSOR_MAX_AGE_SECONDS:-900}
+      OPERATOR_PROCESSOR_DISCOVERY_CHECK_AVAILABILITY: ${OPERATOR_PROCESSOR_DISCOVERY_CHECK_AVAILABILITY:-false}
+      OPERATOR_PROCESSOR_DISCOVERY_START_DELAY_MS: ${OPERATOR_PROCESSOR_DISCOVERY_START_DELAY_MS:-120000}
+      OPERATOR_PROCESSOR_DISCOVERY_DURATION_MS: ${OPERATOR_PROCESSOR_DISCOVERY_DURATION_MS:-300000}
+      OPERATOR_PROCESSOR_LIMIT: ${OPERATOR_PROCESSOR_LIMIT:-0}
+      ACURAST_NETWORK: ${ACURAST_NETWORK:-mainnet}
+      ACURAST_RPC: ${ACURAST_RPC:-}
+      ACURAST_CANARY_RPC: ${ACURAST_CANARY_RPC:-}
+      OPERATOR_FLOOR_PRICE_PER_MINUTE: ${OPERATOR_FLOOR_PRICE_PER_MINUTE:-}
+      OPERATOR_PAYOUT_ADDRESS: ${OPERATOR_PAYOUT_ADDRESS:-}
+      OPERATOR_SUPPORTED_ASSETS: ${OPERATOR_SUPPORTED_ASSETS:-}
+      ENVOY_XDS_DIR: /var/lib/switchboard/xds
+      ROUTE_INTENT_STATE_FILE: /var/lib/switchboard/gateway-agent/route-intents.json
+      GATEWAY_AGENT_PORT: 18080
+    ports:
+      - "${GATEWAY_AGENT_BIND_ADDR:-127.0.0.1}:${GATEWAY_AGENT_PORT:-18080}:18080/tcp"
+    volumes:
+      - xds-state:/var/lib/switchboard/xds
+      - gateway-agent-state:/var/lib/switchboard/gateway-agent
+    restart: unless-stopped
+    networks:
+      - operator
+
+  hub-watcher:
+    image: ${HUB_WATCHER_IMAGE:-ghcr.io/proof-computer/switchboard-gateway/gateway:latest}
+    command:
+      - npm
+      - run
+      - gateway:hub-watcher
+    environment:
+      HUB_ETH_RPC_URL: ${HUB_ETH_RPC_URL:-https://services.polkadothub-rpc.com/mainnet}
+      HUB_CHAIN_PROFILE: ${HUB_CHAIN_PROFILE:-polkadot-hub}
+      HUB_CHAIN_ID: ${HUB_CHAIN_ID:-420420419}
+      INGRESS_REGISTRY_ADDRESS: ${INGRESS_REGISTRY_ADDRESS:-}
+      GATEWAY_ID: ${GATEWAY_ID:-}
+      OPERATOR_ID: ${OPERATOR_ID:-}
+      HUB_WATCH_START_BLOCK: ${HUB_WATCH_START_BLOCK:-0}
+      HUB_CONFIRMATIONS: ${HUB_CONFIRMATIONS:-12}
+      HUB_WATCH_MAX_BLOCK_RANGE: ${HUB_WATCH_MAX_BLOCK_RANGE:-1000}
+      HUB_POLL_INTERVAL_MS: ${HUB_POLL_INTERVAL_MS:-5000}
+      PROOF_NETWORK_MANIFEST_URL: ${PROOF_NETWORK_MANIFEST_URL:-}
+      PROOF_NETWORK_MANIFEST_SIGNER: ${PROOF_NETWORK_MANIFEST_SIGNER:-}
+      PROOF_NETWORK_MANIFEST_REFRESH_MS: ${PROOF_NETWORK_MANIFEST_REFRESH_MS:-60000}
+      ROUTE_METADATA_FILE: /etc/switchboard/routes.json
+      ROUTE_INTENT_OUTPUT_URL: ${ROUTE_INTENT_OUTPUT_URL:-http://gateway-agent:18080/internal/route-intents}
+      ROUTE_INTENT_OUTPUT_TOKEN: ${ROUTE_INTENT_OUTPUT_TOKEN:-}
+    volumes:
+      - hub-watcher-state:/var/lib/switchboard/hub-watcher
+      - ${ROUTE_METADATA_HOST_FILE:-./docker/operator/routes.example.json}:/etc/switchboard/routes.json:ro
+    depends_on:
+      gateway-agent:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - operator
+
+  tls-test-upstream:
+    image: ${TLS_TEST_UPSTREAM_IMAGE:-ghcr.io/proof-computer/switchboard-gateway/tls-test-upstream:latest}
+    profiles:
+      - test-upstream
+    restart: unless-stopped
+    networks:
+      - operator
+
+networks:
+  operator:
+    driver: bridge
+
+volumes:
+  victoria-metrics-data:
+  grafana-data:
+  hub-watcher-state:
+  gateway-agent-state:
+  xds-state:
