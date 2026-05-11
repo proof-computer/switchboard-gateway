@@ -232,4 +232,34 @@ describe("route reporting", () => {
       downstreamBytesSentTotal: "2048"
     });
   });
+
+  it("parses Envoy Prometheus counters when dotted stat prefixes are split", () => {
+    const route = normalizeRouteIntent({
+      routeId: "route-beta",
+      sessionId: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      hostname: "e-y47wjz4nabc44y4jfuwe.acurast.ingress.guru",
+      upstreamHost: "192.168.0.55",
+      upstreamPort: 3443,
+      expiresAt: Math.floor(Date.now() / 1000) + 600
+    });
+    const metrics = parseEnvoyRouteMetrics(
+      [
+        'envoy_tcp_acurast_ingress_guru_downstream_cx_total{envoy_tcp_prefix="sni_e-y47wjz4nabc44y4jfuwe"} 56',
+        'envoy_tcp_acurast_ingress_guru_downstream_cx_rx_bytes_total{envoy_tcp_prefix="sni_e-y47wjz4nabc44y4jfuwe"} 123298',
+        'envoy_tcp_acurast_ingress_guru_downstream_cx_tx_bytes_total{envoy_tcp_prefix="sni_e-y47wjz4nabc44y4jfuwe"} 489334',
+        'envoy_tcp_acurast_ingress_team_downstream_cx_total{envoy_tcp_prefix="sni_e-other"} 107'
+      ].join("\n"),
+      [route],
+      new Date("2026-05-11T12:00:00.000Z")
+    );
+
+    assert.equal(metrics.length, 1);
+    assert.equal(metrics[0]?.routeId, "route-beta");
+    assert.equal(metrics[0]?.statPrefix, "sni_e-y47wjz4nabc44y4jfuwe.acurast.ingress.guru");
+    assert.deepEqual(metrics[0]?.counters, {
+      downstreamConnectionsTotal: "56",
+      downstreamBytesReceivedTotal: "123298",
+      downstreamBytesSentTotal: "489334"
+    });
+  });
 });

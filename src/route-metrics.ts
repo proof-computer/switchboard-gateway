@@ -117,5 +117,15 @@ function metricMatchesPrefix(metric: { name: string; labels: Record<string, stri
   if (metric.name.includes(statPrefix)) {
     return true;
   }
-  return Object.values(metric.labels).some((value) => value === statPrefix || value.includes(statPrefix));
+  const labelValues = Object.values(metric.labels);
+  if (labelValues.some((value) => value === statPrefix || value.includes(statPrefix))) {
+    return true;
+  }
+
+  const [firstSegment, ...remainingSegments] = statPrefix.split(".");
+  const nameFragment = remainingSegments.join("_");
+  if (!firstSegment || !nameFragment) {
+    return false;
+  }
+  return metric.name.includes(nameFragment) && labelValues.some((value) => value === firstSegment || value.includes(firstSegment));
 }
