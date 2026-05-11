@@ -45,6 +45,23 @@ const operatorEconomicsSchema = z.object({
   supportedAssets: z.array(address).optional()
 }).optional();
 
+const uintString = z.string().regex(/^[0-9]+$/);
+
+const gatewayRouteMetricsSchema = z.object({
+  routeId: z.string().min(1).max(160).optional(),
+  hostname: z.string().min(1).max(253),
+  statPrefix: z.string().min(1).max(253).optional(),
+  sampledAt: z.string().min(1),
+  counters: z.object({
+    downstreamConnectionsTotal: uintString.optional(),
+    downstreamBytesReceivedTotal: uintString.optional(),
+    downstreamBytesSentTotal: uintString.optional(),
+    upstreamConnectionsTotal: uintString.optional(),
+    upstreamBytesReceivedTotal: uintString.optional(),
+    upstreamBytesSentTotal: uintString.optional()
+  }).default({})
+});
+
 export const gatewayCapabilityReportSchema = z.object({
   version: z.literal(1),
   kind: z.enum(["switchboard.operator.capability", "proof-ingress.operator.capability"]),
@@ -69,7 +86,8 @@ export const gatewayCapabilityReportSchema = z.object({
     activeRouteCount: z.number().int().nonnegative(),
     routeCapacity: z.number().int().nonnegative(),
     softwareVersion: z.string().min(1).optional(),
-    supportedClasses: z.array(z.string().min(1)).default([])
+    supportedClasses: z.array(z.string().min(1)).default([]),
+    routeMetrics: z.array(gatewayRouteMetricsSchema).max(500).optional()
   }),
   processorScopes: z.array(processorScopeSchema).default([]),
   economics: operatorEconomicsSchema

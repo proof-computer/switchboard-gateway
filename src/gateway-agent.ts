@@ -13,6 +13,7 @@ import {
   type ManagerProcessorInventory
 } from "./acurast-manager.js";
 import { normalizeHostname, normalizeRouteIntent, routeHostnames, routeIsActive, type RouteIntent } from "./route-intent.js";
+import { collectEnvoyRouteMetrics } from "./route-metrics.js";
 import { buildRouteStatusReport, type RouteStatusReportFilters } from "./route-status-report.js";
 import { renderFileXds } from "./xds.js";
 import { processorRefToId, signGatewayCapabilityReport, type GatewayCapabilityReport } from "./operator-capability.js";
@@ -48,6 +49,13 @@ const routeStateToken = process.env.GATEWAY_ROUTE_STATE_TOKEN ?? process.env.PRO
 const routeStatePollIntervalMs = numberEnv("GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS", 5_000);
 const routeStateTimeoutMs = numberEnv("GATEWAY_ROUTE_STATE_TIMEOUT_MS", 5_000);
 const routeStateRemovalGraceMs = numberEnv("GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS", 15_000);
+const routeMetricsEnabled = boolEnv("GATEWAY_ROUTE_METRICS_ENABLED", true);
+const routeMetricsStatsUrl =
+  optionalStringEnv("GATEWAY_ENVOY_STATS_URL") ??
+  optionalStringEnv("ENVOY_ADMIN_STATS_URL") ??
+  "http://envoy:9901/stats/prometheus";
+const routeMetricsTimeoutMs = numberEnv("GATEWAY_ROUTE_METRICS_TIMEOUT_MS", 1500);
+const routeMetricsMaxRoutes = numberEnv("GATEWAY_ROUTE_METRICS_MAX_ROUTES", 200);
 const routeCapacity = numberEnv("GATEWAY_ROUTE_CAPACITY", 500);
 const staticPublicAddresses = splitCsv(process.env.OPERATOR_PUBLIC_ADDRESSES ?? process.env.GATEWAY_PUBLIC_ADDRESSES ?? "");
 const publicAddressMode = normalizeOperatorPublicAddressMode(process.env.OPERATOR_PUBLIC_ADDRESS_MODE, staticPublicAddresses);
@@ -128,6 +136,11 @@ app.get("/health", async () => ({
   routeState: routeStateStatus,
   publicAddress: publicAddressState,
   processorDiscovery: processorDiscoveryHealth(),
+  routeMetrics: {
+    enabled: routeMetricsEnabled,
+    statsUrl: routeMetricsEnabled ? routeMetricsStatsUrl : undefined,
+    maxRoutes: routeMetricsMaxRoutes
+  },
   xdsDir
 }));
 
@@ -341,6 +354,7 @@ async function buildSignedGatewayCapabilityReport() {
     throw new Error("OPERATOR_REPORT_SEED or OPERATOR_REPORT_PRIVATE_KEY is required for gateway capability reports");
   }
   const publicAddressReport = await gatewayPublicAddressReportState();
+  const routeMetrics = await gatewayRouteMetricsForReport();
 
   const now = new Date();
   const nowUnixSeconds = Math.floor(now.getTime() / 1000);
@@ -368,7 +382,8 @@ async function buildSignedGatewayCapabilityReport() {
       activeRouteCount: activeRoutes().length,
       routeCapacity,
       softwareVersion: process.env.PROOF_OPERATOR_SOFTWARE_VERSION,
-      supportedClasses
+      supportedClasses,
+      routeMetrics: routeMetrics.length > 0 ? routeMetrics : undefined
     },
     processorScopes: await capabilityProcessorScopes(),
     economics:
@@ -385,6 +400,29 @@ async function buildSignedGatewayCapabilityReport() {
     scheme: reportSigningScheme,
     ss58Format: reportSigningSs58Format
   });
+}
+
+async function gatewayRouteMetricsForReport(): Promise<NonNullable<GatewayCapabilityReport["gateway"]["routeMetrics"]>> {
+  if (!routeMetricsEnabled) {
+    return [];
+  }
+  try {
+    return await collectEnvoyRouteMetrics({
+      routes: activeRoutes(),
+      statsUrl: routeMetricsStatsUrl,
+      timeoutMs: routeMetricsTimeoutMs,
+      maxRoutes: routeMetricsMaxRoutes
+    });
+  } catch (error) {
+    app.log.debug(
+      {
+        error: error instanceof Error ? error.message : String(error),
+        statsUrl: routeMetricsStatsUrl
+      },
+      "gateway route metrics unavailable"
+    );
+    return [];
+  }
 }
 
 async function gatewayPublicAddressReportState(): Promise<typeof publicAddressState> {

@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 
 import { normalizeRouteIntent, routeServerNames } from "../src/route-intent.js";
+import { parseEnvoyRouteMetrics } from "../src/route-metrics.js";
 import { buildRouteStatusReport } from "../src/route-status-report.js";
 import { renderFileXds } from "../src/xds.js";
 import { verifyReportSignature } from "../src/report-signing.js";
@@ -198,5 +199,37 @@ describe("route reporting", () => {
         .sort(),
       [["ha-a.validation.ingress.works"], ["ha-b.validation.ingress.works"]]
     );
+  });
+
+  it("parses Envoy route counters for capability reports", () => {
+    const route = normalizeRouteIntent({
+      routeId: "route-alpha",
+      sessionId: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      hostname: "Alpha.Ingress.Works",
+      upstreamHost: "192.168.3.10",
+      upstreamPort: 3443,
+      expiresAt: Math.floor(Date.now() / 1000) + 600
+    });
+    const metrics = parseEnvoyRouteMetrics(
+      [
+        'envoy_tcp_downstream_cx_total{envoy_tcp_prefix="sni_alpha.ingress.works"} 7',
+        'envoy_tcp_downstream_cx_rx_bytes_total{envoy_tcp_prefix="sni_alpha.ingress.works"} 1024',
+        'envoy_tcp_downstream_cx_tx_bytes_total{envoy_tcp_prefix="sni_alpha.ingress.works"} 2048',
+        'envoy_tcp_downstream_cx_total{envoy_tcp_prefix="sni_unmatched"} 99'
+      ].join("\n"),
+      [route],
+      new Date("2026-05-11T12:00:00.000Z")
+    );
+
+    assert.equal(metrics.length, 1);
+    assert.equal(metrics[0]?.routeId, "route-alpha");
+    assert.equal(metrics[0]?.hostname, "alpha.ingress.works");
+    assert.equal(metrics[0]?.statPrefix, "sni_alpha.ingress.works");
+    assert.equal(metrics[0]?.sampledAt, "2026-05-11T12:00:00.000Z");
+    assert.deepEqual(metrics[0]?.counters, {
+      downstreamConnectionsTotal: "7",
+      downstreamBytesReceivedTotal: "1024",
+      downstreamBytesSentTotal: "2048"
+    });
   });
 });
