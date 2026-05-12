@@ -49,6 +49,10 @@ const routeStateToken = process.env.GATEWAY_ROUTE_STATE_TOKEN ?? process.env.PRO
 const routeStatePollIntervalMs = numberEnv("GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS", 5_000);
 const routeStateTimeoutMs = numberEnv("GATEWAY_ROUTE_STATE_TIMEOUT_MS", 5_000);
 const routeStateRemovalGraceMs = numberEnv("GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS", 15_000);
+const routeStateWatchdogMs = numberEnv(
+  "GATEWAY_ROUTE_STATE_WATCHDOG_MS",
+  Math.max(routeStateTimeoutMs * 3, routeStatePollIntervalMs * 3, 15_000)
+);
 const routeMetricsEnabled = boolEnv("GATEWAY_ROUTE_METRICS_ENABLED", true);
 const routeMetricsStatsUrl =
   optionalStringEnv("GATEWAY_ENVOY_STATS_URL") ??
@@ -93,18 +97,45 @@ let managerInventoryRefreshedAt: string | undefined;
 let managerInventoryRefreshStartedAt = 0;
 let managerInventoryRefresh: Promise<void> | undefined;
 let publicAddressRefresh: Promise<void> | undefined;
-let routeStatePoll: Promise<void> | undefined;
-let routeStateStatus: {
+interface RouteStateStatus {
   enabled: boolean;
   url?: string;
   lastCheckedAt?: string;
   lastAppliedAt?: string;
+  lastSuccessAt?: string;
+  lastCompletedAt?: string;
   lastError?: string;
   polledRouteCount?: number;
   desiredRouteCount?: number;
-} = {
+  lastAppliedRouteIds?: string[];
+  lastRemovedRouteIds?: string[];
+  lastRemovalReason?: string;
+  configVersion?: string;
+  consecutiveFailures: number;
+  inFlightStartedAt?: string;
+  inFlightAgeMs?: number;
+  watchdogAbortCount: number;
+  healthy: boolean;
+  staleAfterMs: number;
+}
+
+let routeStateGeneration = 0;
+let routeStateInFlight:
+  | {
+      generation: number;
+      startedAtMs: number;
+      startedAt: string;
+      abortController: AbortController;
+      promise: Promise<void>;
+    }
+  | undefined;
+let routeStateStatus: RouteStateStatus = {
   enabled: Boolean(routeStateUrl),
-  url: routeStateUrl
+  url: routeStateUrl,
+  consecutiveFailures: 0,
+  watchdogAbortCount: 0,
+  healthy: !routeStateUrl,
+  staleAfterMs: routeStateWatchdogMs
 };
 let publicAddressState: {
   mode: OperatorPublicAddressMode;
@@ -133,7 +164,7 @@ app.get("/health", async () => ({
   configVersion: configVersion.toString(),
   reportSigningEnabled: Boolean(reportSigningKey),
   reportSigningScheme,
-  routeState: routeStateStatus,
+  routeState: routeStateHealthStatus(),
   publicAddress: publicAddressState,
   processorDiscovery: processorDiscoveryHealth(),
   routeMetrics: {
@@ -383,6 +414,9 @@ async function buildSignedGatewayCapabilityReport() {
       routeCapacity,
       softwareVersion: process.env.PROOF_OPERATOR_SOFTWARE_VERSION,
       supportedClasses,
+      routeStateHealthy: routeStateUrl ? routeStateHealthy() : undefined,
+      routeStateLastSuccessAt: routeStateStatus.lastSuccessAt,
+      routeState: routeStateHealthStatus(),
       routeMetrics: routeMetrics.length > 0 ? routeMetrics : undefined
     },
     processorScopes: await capabilityProcessorScopes(),
@@ -803,39 +837,89 @@ async function loadState(): Promise<void> {
   }
 }
 
-async function pollRouteState(): Promise<void> {
+function pollRouteState(): void {
   if (!routeStateUrl) {
     return;
   }
-  if (routeStatePoll) {
-    await routeStatePoll;
-    return;
+  const nowMs = Date.now();
+  if (routeStateInFlight) {
+    const ageMs = nowMs - routeStateInFlight.startedAtMs;
+    if (ageMs <= routeStateWatchdogMs) {
+      return;
+    }
+    const staleGeneration = routeStateInFlight.generation;
+    routeStateInFlight.abortController.abort();
+    routeStateInFlight = undefined;
+    routeStateStatus = {
+      ...routeStateStatus,
+      lastError: `route state poll generation ${staleGeneration} exceeded watchdog ${routeStateWatchdogMs}ms`,
+      lastCompletedAt: new Date(nowMs).toISOString(),
+      consecutiveFailures: routeStateStatus.consecutiveFailures + 1,
+      watchdogAbortCount: routeStateStatus.watchdogAbortCount + 1
+    };
+    app.log.warn(
+      {
+        generation: staleGeneration,
+        ageMs,
+        watchdogMs: routeStateWatchdogMs,
+        url: routeStateUrl
+      },
+      "gateway route state poll watchdog aborted stale generation"
+    );
   }
-  routeStatePoll = doPollRouteState().finally(() => {
-    routeStatePoll = undefined;
-  });
-  await routeStatePoll;
+  const generation = routeStateGeneration + 1;
+  routeStateGeneration = generation;
+  const startedAtMs = Date.now();
+  const abortController = new AbortController();
+  routeStateInFlight = {
+    generation,
+    startedAtMs,
+    startedAt: new Date(startedAtMs).toISOString(),
+    abortController,
+    promise: doPollRouteState(generation, abortController.signal).finally(() => {
+      if (routeStateInFlight?.generation === generation) {
+        routeStateInFlight = undefined;
+      }
+    })
+  };
 }
 
-async function doPollRouteState(): Promise<void> {
+async function doPollRouteState(generation: number, signal: AbortSignal): Promise<void> {
   const checkedAt = new Date().toISOString();
   try {
-    const state = await fetchRouteState();
+    const state = await fetchRouteState(signal);
+    if (!routeStateGenerationCurrent(generation)) {
+      return;
+    }
     const polledRoutes = desiredRoutesFromRouteState(state);
     const desiredRoutes = routesWithRemovalGrace(polledRoutes, Date.now());
+    const beforeIds = [...routes.keys()].sort();
+    const afterIds = [...desiredRoutes.keys()].sort();
+    const removedIds = beforeIds.filter((routeId) => !desiredRoutes.has(routeId));
+    const completedAt = new Date().toISOString();
     if (!routeMapsEqual(routes, desiredRoutes)) {
       routes.clear();
       for (const route of desiredRoutes.values()) {
         routes.set(route.routeId, route);
       }
       await persistAndRender();
+      if (!routeStateGenerationCurrent(generation)) {
+        return;
+      }
       routeStateStatus = {
         ...routeStateStatus,
         lastCheckedAt: checkedAt,
-        lastAppliedAt: checkedAt,
+        lastAppliedAt: completedAt,
+        lastSuccessAt: completedAt,
+        lastCompletedAt: completedAt,
         lastError: undefined,
         polledRouteCount: polledRoutes.size,
-        desiredRouteCount: desiredRoutes.size
+        desiredRouteCount: desiredRoutes.size,
+        lastAppliedRouteIds: afterIds,
+        lastRemovedRouteIds: removedIds,
+        lastRemovalReason: removedIds.length > 0 ? "route_state_omitted_after_grace" : undefined,
+        configVersion: configVersion.toString(),
+        consecutiveFailures: 0
       };
       app.log.info({ routeCount: desiredRoutes.size, polledRouteCount: polledRoutes.size, url: routeStateUrl }, "gateway route state applied");
       return;
@@ -843,24 +927,64 @@ async function doPollRouteState(): Promise<void> {
     routeStateStatus = {
       ...routeStateStatus,
       lastCheckedAt: checkedAt,
+      lastSuccessAt: completedAt,
+      lastCompletedAt: completedAt,
       lastError: undefined,
       polledRouteCount: polledRoutes.size,
-      desiredRouteCount: desiredRoutes.size
+      desiredRouteCount: desiredRoutes.size,
+      configVersion: configVersion.toString(),
+      consecutiveFailures: 0
     };
   } catch (error) {
+    if (!routeStateGenerationCurrent(generation)) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     routeStateStatus = {
       ...routeStateStatus,
       lastCheckedAt: checkedAt,
-      lastError: message
+      lastCompletedAt: new Date().toISOString(),
+      lastError: message,
+      consecutiveFailures: routeStateStatus.consecutiveFailures + 1
     };
     app.log.warn({ error: message, url: routeStateUrl }, "gateway route state poll failed");
   }
 }
 
-async function fetchRouteState(): Promise<Record<string, unknown>> {
+function routeStateGenerationCurrent(generation: number): boolean {
+  return generation === routeStateGeneration;
+}
+
+function routeStateHealthStatus(): RouteStateStatus {
+  const inFlight = routeStateInFlight;
+  const nowMs = Date.now();
+  const inFlightAgeMs = inFlight ? nowMs - inFlight.startedAtMs : undefined;
+  return {
+    ...routeStateStatus,
+    inFlightStartedAt: inFlight?.startedAt,
+    inFlightAgeMs,
+    healthy: routeStateHealthy(nowMs, inFlightAgeMs)
+  };
+}
+
+function routeStateHealthy(nowMs = Date.now(), inFlightAgeMs?: number): boolean {
+  if (!routeStateUrl) {
+    return true;
+  }
+  if (inFlightAgeMs !== undefined && inFlightAgeMs > routeStateWatchdogMs) {
+    return false;
+  }
+  if (!routeStateStatus.lastSuccessAt) {
+    return false;
+  }
+  return nowMs - Date.parse(routeStateStatus.lastSuccessAt) <= routeStateWatchdogMs;
+}
+
+async function fetchRouteState(signal: AbortSignal): Promise<Record<string, unknown>> {
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), routeStateTimeoutMs);
+  const abortFromCaller = () => abortController.abort();
+  signal.addEventListener("abort", abortFromCaller, { once: true });
   try {
     const response = await fetch(routeStateUrl!, {
       method: "GET",
@@ -874,6 +998,7 @@ async function fetchRouteState(): Promise<Record<string, unknown>> {
     return objectRecord(JSON.parse(body), "route state response");
   } finally {
     clearTimeout(timeout);
+    signal.removeEventListener("abort", abortFromCaller);
   }
 }
 

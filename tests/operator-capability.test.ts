@@ -57,8 +57,8 @@ function sampleReport(): GatewayCapabilityReport {
   };
 }
 
-async function signedStoredReport(): Promise<StoredGatewayCapabilityReport> {
-  const signed = await signGatewayCapabilityReport(sampleReport(), ATTACKER_PRIVATE_KEY, {
+async function signedStoredReport(report: GatewayCapabilityReport = sampleReport()): Promise<StoredGatewayCapabilityReport> {
+  const signed = await signGatewayCapabilityReport(report, ATTACKER_PRIVATE_KEY, {
     signedAt: "2026-05-08T00:00:00.000Z"
   });
   const verified = await verifySignedGatewayCapabilityReport(signed, {
@@ -124,5 +124,32 @@ describe("operator capability signer authorization", () => {
       requireRouteStateUrl: true
     });
     assert.equal(restricted, undefined);
+  });
+
+  it("skips explicitly unhealthy route-state reports when route-state is required", async () => {
+    const report = sampleReport();
+    report.gateway.routeStateHealthy = false;
+    report.gateway.routeStateLastSuccessAt = "2026-05-08T00:00:00.000Z";
+    const stored = await signedStoredReport(report);
+    const selected = selectOperatorCapabilityCandidate({
+      profiles: [sampleProfile({ reportSigners: [stored.signer] })],
+      reports: [stored],
+      now: new Date("2026-05-08T00:00:02.000Z"),
+      requireRouteStateUrl: true
+    });
+
+    assert.equal(selected, undefined);
+  });
+
+  it("keeps legacy route-state reports selectable when health is omitted", async () => {
+    const stored = await signedStoredReport();
+    const selected = selectOperatorCapabilityCandidate({
+      profiles: [sampleProfile({ reportSigners: [stored.signer] })],
+      reports: [stored],
+      now: new Date("2026-05-08T00:00:02.000Z"),
+      requireRouteStateUrl: true
+    });
+
+    assert.equal(selected?.gatewayId, "attacker-gateway");
   });
 });
