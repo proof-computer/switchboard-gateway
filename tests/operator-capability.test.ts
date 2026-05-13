@@ -2,6 +2,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  OPERATOR_CAPABILITY_REPORT_DOMAIN,
+  normalizeGatewayCapabilityReport,
+  operatorCapabilityRouteIntentUrl,
   parseOperatorProfiles,
   reportSignerAllowedByProfile,
   selectOperatorCapabilityCandidate,
@@ -11,6 +14,7 @@ import {
   type OperatorProfile,
   type StoredGatewayCapabilityReport
 } from "../src/operator-capability.js";
+import { signReportPayload } from "../src/report-signing.js";
 
 const OPERATOR_ID = "0x1111111111111111111111111111111111111111111111111111111111111111";
 const PROCESSOR_ID = "0x2222222222222222222222222222222222222222222222222222222222222222";
@@ -151,5 +155,85 @@ describe("operator capability signer authorization", () => {
     });
 
     assert.equal(selected?.gatewayId, "attacker-gateway");
+  });
+
+  it("preserves minimal processor-discovery diagnostics in signed reports", async () => {
+    const report = sampleReport();
+    report.gateway.processorDiscoveryFresh = false;
+    report.gateway.reportedProcessorCount = 0;
+
+    const stored = await signedStoredReport(report);
+
+    assert.equal(stored.report.gateway.processorDiscoveryFresh, false);
+    assert.equal(stored.report.gateway.reportedProcessorCount, 0);
+  });
+
+  it("strips legacy report route-intent URLs from new signed capability reports", async () => {
+    const report = sampleReport();
+    report.gateway.routeIntentUrl = "https://attacker.example/route-intents";
+
+    const signed = await signGatewayCapabilityReport(report, ATTACKER_PRIVATE_KEY, {
+      signedAt: "2026-05-08T00:00:00.000Z"
+    });
+    const verified = await verifySignedGatewayCapabilityReport(signed, {
+      now: new Date("2026-05-08T00:00:01.000Z")
+    });
+
+    assert.equal("routeIntentUrl" in signed.report.gateway, false);
+    assert.equal("routeIntentUrl" in verified.report.gateway, false);
+  });
+
+  it("accepts legacy signed reports with route-intent URLs but strips them before storage", async () => {
+    const report = sampleReport();
+    report.gateway.routeIntentUrl = "https://attacker.example/route-intents";
+    const legacyReport = normalizeGatewayCapabilityReport(report, { preserveLegacyRouteIntentUrl: true });
+    const signature = await signReportPayload(ATTACKER_PRIVATE_KEY, OPERATOR_CAPABILITY_REPORT_DOMAIN, legacyReport, {
+      signedAt: "2026-05-08T00:00:00.000Z"
+    });
+
+    const verified = await verifySignedGatewayCapabilityReport({ report: legacyReport, signature }, {
+      now: new Date("2026-05-08T00:00:01.000Z")
+    });
+
+    assert.equal("routeIntentUrl" in legacyReport.gateway, true);
+    assert.equal("routeIntentUrl" in verified.report.gateway, false);
+  });
+
+  it("does not treat report route-intent URLs as selectable sinks", async () => {
+    const stored = await signedStoredReport();
+    stored.report.gateway.routeIntentUrl = "https://attacker.example/route-intents";
+
+    const selected = selectOperatorCapabilityCandidate({
+      profiles: [sampleProfile({ reportSigners: [stored.signer] })],
+      reports: [stored],
+      now: new Date("2026-05-08T00:00:02.000Z"),
+      requireRouteIntentSink: true
+    });
+
+    assert.equal(operatorCapabilityRouteIntentUrl(sampleProfile(), stored.report), undefined);
+    assert.equal(selected, undefined);
+  });
+
+  it("selects profile-pinned route-intent sinks", async () => {
+    const stored = await signedStoredReport();
+    stored.report.gateway.routeIntentUrl = "https://attacker.example/route-intents";
+    const profileRouteIntentUrl = "https://profile.example/route-intents";
+
+    const selected = selectOperatorCapabilityCandidate({
+      profiles: [
+        sampleProfile({
+          reportSigners: [stored.signer],
+          gatewayIds: ["attacker-gateway"],
+          routeIntentUrl: profileRouteIntentUrl,
+          routeIntentTokenEnv: "PROFILE_ROUTE_INTENT_TOKEN"
+        })
+      ],
+      reports: [stored],
+      now: new Date("2026-05-08T00:00:02.000Z"),
+      requireRouteIntentSink: true
+    });
+
+    assert.equal(selected?.routeIntentUrl, profileRouteIntentUrl);
+    assert.equal(selected?.routeIntentTokenEnv, "PROFILE_ROUTE_INTENT_TOKEN");
   });
 });

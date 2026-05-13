@@ -43,7 +43,6 @@ const capabilityReportToken = process.env.PROOF_OPERATOR_CAPABILITY_TOKEN;
 const capabilityReportIntervalMs = numberEnv("OPERATOR_CAPABILITY_REPORT_INTERVAL_MS", 60_000);
 const capabilityReportTtlSeconds = numberEnv("OPERATOR_CAPABILITY_REPORT_TTL_SECONDS", 180);
 const routeIntentToken = process.env.GATEWAY_AGENT_ROUTE_INTENT_TOKEN;
-const routeIntentUrl = optionalStringEnv("GATEWAY_AGENT_ROUTE_INTENT_URL");
 const routeStateUrl = optionalStringEnv("GATEWAY_ROUTE_STATE_URL");
 const routeStateToken = process.env.GATEWAY_ROUTE_STATE_TOKEN ?? process.env.PROOF_OPERATOR_CAPABILITY_TOKEN;
 const routeStatePollIntervalMs = numberEnv("GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS", 5_000);
@@ -409,9 +408,10 @@ async function buildSignedGatewayCapabilityReport() {
       publicAddressProbeError: publicAddressReport.probeError,
       validationHostname,
       routeStateUrl,
-      routeIntentUrl,
       activeRouteCount: activeRoutes().length,
       routeCapacity,
+      processorDiscoveryFresh: managerInventoryFresh(),
+      reportedProcessorCount: reportedProcessorCount(),
       softwareVersion: process.env.PROOF_OPERATOR_SOFTWARE_VERSION,
       supportedClasses,
       routeStateHealthy: routeStateUrl ? routeStateHealthy() : undefined,
@@ -748,22 +748,36 @@ function processorRefSetHas(refs: string[], processor: string): boolean {
 }
 
 function processorDiscoveryHealth() {
+  const refreshedAtMs = managerInventoryRefreshedAt ? Date.parse(managerInventoryRefreshedAt) : undefined;
+  const fresh = managerInventoryFresh();
   return {
     enabled: processorDiscoveryEnabled,
     network: acurastNetwork,
     rpcUrl: processorDiscoveryEnabled ? rpcForAcurastNetwork(acurastNetwork, acurastRpcUrl) : undefined,
     managerIds: advertisedManagerIds,
+    fresh,
     maxAgeSeconds: processorDiscoveryMaxAgeSeconds,
+    intervalMs: processorDiscoveryIntervalMs,
     checkAvailability: processorDiscoveryAvailability,
+    startDelayMs: processorDiscoveryStartDelayMs,
+    durationMs: processorDiscoveryDurationMs,
+    limit: processorDiscoveryLimit,
+    includeProcessors: advertisedProcessors,
+    excludeProcessors: excludedProcessors,
+    refreshInFlight: Boolean(managerInventoryRefresh),
+    refreshStartedAt: managerInventoryRefreshStartedAt > 0 ? new Date(managerInventoryRefreshStartedAt).toISOString() : undefined,
     refreshedAt: managerInventoryRefreshedAt,
+    staleAfterMs: refreshedAtMs === undefined ? undefined : Math.max(0, refreshedAtMs + processorDiscoveryIntervalMs + 30_000 - Date.now()),
     error: managerInventoryError,
+    lastError: managerInventoryError,
     inventories: [...managerInventories.values()].map((inventory) => ({
       managerId: inventory.managerId,
       totalProcessors: inventory.totalProcessors,
       recentProcessors: inventory.recentProcessors,
       availableProcessors: inventory.availableProcessors,
       recentAvailableProcessors: inventory.recentAvailableProcessors,
-      reportedProcessors: processorsForManagerScope(inventory.managerId)?.length ?? 0
+      reportedProcessors: processorsForManagerScope(inventory.managerId)?.length ?? 0,
+      availabilityWindow: inventory.availabilityWindow
     }))
   };
 }

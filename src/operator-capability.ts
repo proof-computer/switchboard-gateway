@@ -109,6 +109,8 @@ export const gatewayCapabilityReportSchema = z.object({
     routeIntentUrl: z.string().url().optional(),
     activeRouteCount: z.number().int().nonnegative(),
     routeCapacity: z.number().int().nonnegative(),
+    processorDiscoveryFresh: z.boolean().optional(),
+    reportedProcessorCount: z.number().int().nonnegative().optional(),
     softwareVersion: z.string().min(1).optional(),
     supportedClasses: z.array(z.string().min(1)).default([]),
     routeState: gatewayRouteStateStatusSchema.optional(),
@@ -170,6 +172,10 @@ export interface VerifyGatewayCapabilityReportOptions {
   allowExpired?: boolean;
 }
 
+export interface NormalizeGatewayCapabilityReportOptions {
+  preserveLegacyRouteIntentUrl?: boolean;
+}
+
 export interface OperatorCapabilityCandidate {
   operatorId: string;
   gatewayId: string;
@@ -226,7 +232,19 @@ export async function verifySignedGatewayCapabilityReport(
   if (!options.allowExpired && capabilityReportExpired(report, options.now)) {
     throw new Error("Operator capability report is expired");
   }
-  const signer = await verifyReportSignature(report, signed.signature);
+  const legacyReport = normalizeGatewayCapabilityReport(signed.report, { preserveLegacyRouteIntentUrl: true });
+  let signer: string;
+  try {
+    signer = await verifyReportSignature(report, signed.signature);
+  } catch (error) {
+    if (!legacyReport.gateway.routeIntentUrl) {
+      throw error;
+    }
+    signer = await verifyReportSignature(legacyReport, signed.signature);
+  }
+  if (!sameSigner(signer, signed.signature.signer) && legacyReport.gateway.routeIntentUrl) {
+    signer = await verifyReportSignature(legacyReport, signed.signature);
+  }
   if (!sameSigner(signer, signed.signature.signer)) {
     throw new Error(`Operator capability signer ${signer} does not match claimed signer ${signed.signature.signer}`);
   }
@@ -250,7 +268,19 @@ export function normalizeOperatorProfile(profile: OperatorProfile): OperatorProf
   };
 }
 
-export function normalizeGatewayCapabilityReport(report: GatewayCapabilityReport): GatewayCapabilityReport {
+export function normalizeGatewayCapabilityReport(
+  report: GatewayCapabilityReport,
+  options: NormalizeGatewayCapabilityReportOptions = {}
+): GatewayCapabilityReport {
+  const { routeIntentUrl: legacyRouteIntentUrl, ...gateway } = report.gateway;
+  const normalizedGateway: GatewayCapabilityReport["gateway"] = {
+    ...gateway,
+    publicAddresses: uniqueStrings(report.gateway.publicAddresses ?? []),
+    supportedClasses: uniqueStrings(report.gateway.supportedClasses ?? [])
+  };
+  if (options.preserveLegacyRouteIntentUrl && legacyRouteIntentUrl) {
+    normalizedGateway.routeIntentUrl = legacyRouteIntentUrl;
+  }
   return {
     ...report,
     operator: {
@@ -258,11 +288,7 @@ export function normalizeGatewayCapabilityReport(report: GatewayCapabilityReport
       operatorId: report.operator.operatorId.toLowerCase(),
       managerIds: uniqueStrings(report.operator.managerIds ?? [])
     },
-    gateway: {
-      ...report.gateway,
-      publicAddresses: uniqueStrings(report.gateway.publicAddresses ?? []),
-      supportedClasses: uniqueStrings(report.gateway.supportedClasses ?? [])
-    },
+    gateway: normalizedGateway,
     processorScopes: report.processorScopes.map((scope) => ({
       ...scope,
       processors: uniqueStrings(scope.processors ?? []),
@@ -350,7 +376,7 @@ export function operatorCapabilityRouteIntentUrl(
   profile: OperatorProfile | undefined,
   report: GatewayCapabilityReport
 ): string | undefined {
-  return report.gateway.routeIntentUrl ?? operatorProfileRouteIntentUrlForGateway(profile, report.operator.gatewayId);
+  return operatorProfileRouteIntentUrlForGateway(profile, report.operator.gatewayId);
 }
 
 export function operatorCapabilityRouteStateUrl(

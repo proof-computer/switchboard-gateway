@@ -110,7 +110,7 @@ describe("gateway route-state polling", () => {
     assert.equal(observedAuthorization, `Bearer ${ROUTE_STATE_TOKEN}`);
     {
       const health = await fetch(`http://127.0.0.1:${gatewayPort}/health`);
-      const body = await health.json() as { routeState?: Record<string, unknown> };
+      const body = await health.json() as { routeState?: Record<string, unknown>; processorDiscovery?: Record<string, unknown> };
       assert.equal(body.routeState?.enabled, true);
       assert.equal(body.routeState?.healthy, true);
       assert.equal(typeof body.routeState?.lastSuccessAt, "string");
@@ -119,6 +119,11 @@ describe("gateway route-state polling", () => {
       assert.deepEqual(body.routeState?.lastAppliedRouteIds, ["polled-route-1"]);
       assert.deepEqual(body.routeState?.lastRemovedRouteIds, []);
       assert.equal(typeof body.routeState?.configVersion, "string");
+      assert.equal(body.processorDiscovery?.enabled, false);
+      assert.equal(body.processorDiscovery?.fresh, undefined);
+      assert.equal(body.processorDiscovery?.checkAvailability, true);
+      assert.equal(body.processorDiscovery?.maxAgeSeconds, 900);
+      assert.equal(body.processorDiscovery?.durationMs, 300000);
     }
 
     desiredRoutes = [];
