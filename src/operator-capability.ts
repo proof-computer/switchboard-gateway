@@ -136,6 +136,8 @@ export const operatorProfileSchema = z.object({
   processorIds: z.array(hex32).default([]),
   routeStateUrl: z.string().url().optional(),
   routeIntentUrl: z.string().url().optional(),
+  upstreamAdmissionUrl: z.string().url().optional(),
+  upstreamAdmissionUrls: z.record(z.string(), z.string().url()).optional(),
   routeIntentTokenEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/).optional(),
   maxActiveSessions: z.number().int().nonnegative().optional(),
   floorPricePerMinute: z.string().regex(/^[0-9]+$/).optional()
@@ -190,6 +192,7 @@ export interface OperatorCapabilityCandidate {
   routeCapacity: number;
   routeStateUrl?: string;
   routeIntentUrl?: string;
+  upstreamAdmissionUrl?: string;
   routeIntentTokenEnv?: string;
   selectionReasons: string[];
 }
@@ -372,6 +375,20 @@ export function operatorProfileRouteStateUrlForGateway(profile: OperatorProfile 
   return undefined;
 }
 
+export function operatorProfileUpstreamAdmissionUrlForGateway(profile: OperatorProfile | undefined, gatewayId: string): string | undefined {
+  const mappedUrl = profile?.upstreamAdmissionUrls?.[gatewayId];
+  if (mappedUrl) {
+    return mappedUrl;
+  }
+  if (!profile?.upstreamAdmissionUrl) {
+    return undefined;
+  }
+  if (profile.gatewayIds.length === 1 && profile.gatewayIds[0] === gatewayId) {
+    return profile.upstreamAdmissionUrl;
+  }
+  return undefined;
+}
+
 export function operatorCapabilityRouteIntentUrl(
   profile: OperatorProfile | undefined,
   report: GatewayCapabilityReport
@@ -409,6 +426,7 @@ export function selectOperatorCapabilityCandidate(
     gatewayKey: string;
     routeStateUrl?: string;
     routeIntentUrl?: string;
+    upstreamAdmissionUrl?: string;
     processors: ReturnType<typeof expandedReportProcessors>;
   }> = [];
 
@@ -442,6 +460,7 @@ export function selectOperatorCapabilityCandidate(
       continue;
     }
     const routeIntentUrl = operatorCapabilityRouteIntentUrl(profile, report);
+    const upstreamAdmissionUrl = operatorProfileUpstreamAdmissionUrlForGateway(profile, report.operator.gatewayId);
     if (input.requireRouteIntentSink && !routeIntentUrl) {
       continue;
     }
@@ -462,6 +481,7 @@ export function selectOperatorCapabilityCandidate(
       gatewayKey: `${operatorId}:${report.operator.gatewayId}`,
       routeStateUrl,
       routeIntentUrl,
+      upstreamAdmissionUrl,
       processors
     });
   }
@@ -498,6 +518,7 @@ export function selectOperatorCapabilityCandidate(
       routeCapacity: report.gateway.routeCapacity,
       routeStateUrl: candidate.routeStateUrl,
       routeIntentUrl: candidate.routeIntentUrl,
+      upstreamAdmissionUrl: candidate.upstreamAdmissionUrl,
       routeIntentTokenEnv: candidate.profile.routeIntentTokenEnv,
       selectionReasons: [
         "operator-profile-active",

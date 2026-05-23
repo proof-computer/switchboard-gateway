@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
+import { isIP } from "node:net";
 import path from "node:path";
+import tls from "node:tls";
 
 import Fastify from "fastify";
 
@@ -15,9 +17,19 @@ import {
 import { normalizeHostname, normalizeRouteIntent, routeHostnames, routeIsActive, type RouteIntent } from "./route-intent.js";
 import { collectEnvoyRouteMetrics } from "./route-metrics.js";
 import { buildRouteStatusReport, type RouteStatusReportFilters } from "./route-status-report.js";
+import { signReportPayload } from "./report-signing.js";
 import { renderFileXds } from "./xds.js";
 import { processorRefToId, signGatewayCapabilityReport, type GatewayCapabilityReport } from "./operator-capability.js";
 import { fetchWanIpv4, normalizeOperatorPublicAddressMode, type OperatorPublicAddressMode } from "./wan-ip.js";
+import {
+  GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
+  gatewayUpstreamAdmissionDigest,
+  gatewayUpstreamAdmissionId,
+  normalizeGatewayUpstreamAdmissionPayload,
+  normalizeSecp256k1SignatureForDigest,
+  type GatewayUpstreamAdmissionPayload,
+  type SignedGatewayUpstreamObservation
+} from "./gateway-upstream-admission.js";
 
 const port = numberEnv("GATEWAY_AGENT_PORT", 18080);
 const host = process.env.GATEWAY_AGENT_HOST ?? "0.0.0.0";
@@ -60,6 +72,11 @@ const routeMetricsStatsUrl =
 const routeMetricsTimeoutMs = numberEnv("GATEWAY_ROUTE_METRICS_TIMEOUT_MS", 1500);
 const routeMetricsMaxRoutes = numberEnv("GATEWAY_ROUTE_METRICS_MAX_ROUTES", 200);
 const routeCapacity = numberEnv("GATEWAY_ROUTE_CAPACITY", 500);
+const upstreamAdmissionTtlSeconds = numberEnv("GATEWAY_UPSTREAM_ADMISSION_TTL_SECONDS", 900);
+const upstreamAdmissionAllowedCidrs = splitCsv(process.env.GATEWAY_UPSTREAM_ADMISSION_ALLOWED_CIDRS ?? "");
+const upstreamAdmissionTlsProbeEnabled = boolEnv("GATEWAY_UPSTREAM_ADMISSION_TLS_PROBE_ENABLED", true);
+const upstreamAdmissionTlsProbeTimeoutMs = numberEnv("GATEWAY_UPSTREAM_ADMISSION_TLS_PROBE_TIMEOUT_MS", 3_000);
+const upstreamAdmissionCaFile = optionalStringEnv("GATEWAY_UPSTREAM_ADMISSION_CA_FILE");
 const staticPublicAddresses = splitCsv(process.env.OPERATOR_PUBLIC_ADDRESSES ?? process.env.GATEWAY_PUBLIC_ADDRESSES ?? "");
 const publicAddressMode = normalizeOperatorPublicAddressMode(process.env.OPERATOR_PUBLIC_ADDRESS_MODE, staticPublicAddresses);
 const wanIpUrl = process.env.OPERATOR_WAN_IP_URL ?? "https://ifconfig.me/ip";
@@ -83,18 +100,32 @@ const processorDiscoveryLimit = numberEnv("OPERATOR_PROCESSOR_LIMIT", 0);
 const processorDiscoveryAvailability = boolEnv("OPERATOR_PROCESSOR_DISCOVERY_CHECK_AVAILABILITY", true);
 const processorDiscoveryStartDelayMs = numberEnv("OPERATOR_PROCESSOR_DISCOVERY_START_DELAY_MS", 120_000);
 const processorDiscoveryDurationMs = numberEnv("OPERATOR_PROCESSOR_DISCOVERY_DURATION_MS", 300_000);
+const processorDiscoveryTimeoutMs = numberEnv(
+  "OPERATOR_PROCESSOR_DISCOVERY_TIMEOUT_MS",
+  Math.max(processorDiscoveryIntervalMs * 2, 120_000)
+);
 const floorPricePerMinute = optionalStringEnv("OPERATOR_FLOOR_PRICE_PER_MINUTE");
 const payoutAddress = optionalStringEnv("OPERATOR_PAYOUT_ADDRESS");
 const supportedAssets = splitCsv(process.env.OPERATOR_SUPPORTED_ASSETS ?? "");
 
 let configVersion = 0;
 const routes = new Map<string, RouteIntent>();
+const upstreamAdmissions = new Map<string, StoredGatewayUpstreamAdmission>();
+const upstreamAdmissionNonces = new Map<string, number>();
 const routeStateOmittedSince = new Map<string, number>();
 const managerInventories = new Map<string, ManagerProcessorInventory>();
 let managerInventoryError: string | undefined;
 let managerInventoryRefreshedAt: string | undefined;
-let managerInventoryRefreshStartedAt = 0;
-let managerInventoryRefresh: Promise<void> | undefined;
+let managerInventoryRefreshGeneration = 0;
+let managerInventoryRefresh:
+  | {
+      generation: number;
+      startedAtMs: number;
+      startedAt: string;
+      promise: Promise<void>;
+    }
+  | undefined;
+let managerInventoryRefreshTimedOutCount = 0;
 let publicAddressRefresh: Promise<void> | undefined;
 interface RouteStateStatus {
   enabled: boolean;
@@ -150,6 +181,10 @@ let publicAddressState: {
   observedAt: staticPublicAddresses.length > 0 ? new Date().toISOString() : undefined
 };
 
+interface StoredGatewayUpstreamAdmission extends SignedGatewayUpstreamObservation {
+  requestSignature: string;
+}
+
 const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL ?? "info"
@@ -160,6 +195,7 @@ app.get("/health", async () => ({
   ok: true,
   routeCount: activeRoutes().length,
   storedRouteCount: routes.size,
+  upstreamAdmissionCount: freshUpstreamAdmissions().length,
   configVersion: configVersion.toString(),
   reportSigningEnabled: Boolean(reportSigningKey),
   reportSigningScheme,
@@ -228,6 +264,35 @@ app.post("/route-intents", async (request, reply) => {
 
 app.post("/internal/route-intents", async (request, reply) => legacyRouteIntentUpsert(request.headers.authorization, request.body, reply));
 
+app.post("/v1/upstream-admissions", async (request, reply) => {
+  try {
+    const admission = await admitGatewayUpstream(request.body, request.raw.socket.remoteAddress, request.raw.socket.remotePort);
+    await persistAndRender();
+    app.log.info(
+      {
+        admissionId: admission.observation.admissionId,
+        intentId: admission.observation.request.intentId,
+        observedIp: admission.observation.observedIp,
+        upstreamPort: admission.observation.request.upstreamPort
+      },
+      "gateway upstream admitted"
+    );
+    return reply.code(201).send({
+      ok: true,
+      request: admission.observation.request,
+      requestSignature: admission.requestSignature,
+      observation: admission.observation,
+      observationSignature: admission.signature
+    });
+  } catch (error) {
+    const statusCode = error instanceof GatewayUpstreamAdmissionError ? error.statusCode : 400;
+    return reply.code(statusCode).send({
+      error: error instanceof GatewayUpstreamAdmissionError ? error.code : "invalid_upstream_admission",
+      reason: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
 app.delete("/route-intents/:routeId", async (request, reply) => {
   const { routeId } = request.params as { routeId: string };
   return legacyRouteIntentDelete(request.headers.authorization, routeId, reply);
@@ -245,11 +310,115 @@ async function legacyRouteIntentState(authorization: string | undefined, reply: 
   return routeIntentStateResponse();
 }
 
+class GatewayUpstreamAdmissionError extends Error {
+  constructor(
+    readonly statusCode: number,
+    readonly code: string,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+async function admitGatewayUpstream(
+  body: unknown,
+  remoteAddress: string | undefined,
+  remotePort: number | undefined
+): Promise<StoredGatewayUpstreamAdmission> {
+  if (!operatorId || !gatewayId) {
+    throw new GatewayUpstreamAdmissionError(503, "gateway_identity_unavailable", "OPERATOR_ID and GATEWAY_ID are required");
+  }
+  if (!reportSigningKey || !reportSigningScheme) {
+    throw new GatewayUpstreamAdmissionError(503, "gateway_observation_signing_unavailable", "gateway report signing is required");
+  }
+  const record = objectRecord(body, "upstream admission request");
+  const request = normalizeGatewayUpstreamAdmissionPayload(parseGatewayUpstreamAdmissionPayload(record.request));
+  const requestSignature = stringField(record, "signature");
+  if (request.operatorId.toLowerCase() !== operatorId.toLowerCase()) {
+    throw new GatewayUpstreamAdmissionError(422, "operator_id_mismatch", "admission operatorId does not match this gateway");
+  }
+  if (request.gatewayId !== gatewayId) {
+    throw new GatewayUpstreamAdmissionError(422, "gateway_id_mismatch", "admission gatewayId does not match this gateway");
+  }
+  if (Number(request.deadline) <= Math.floor(Date.now() / 1000)) {
+    throw new GatewayUpstreamAdmissionError(422, "admission_expired", "admission deadline has expired");
+  }
+  const digest = gatewayUpstreamAdmissionDigest(request);
+  const normalizedRequestSignature = normalizeSecp256k1SignatureForDigest(requestSignature, digest, request.runtimeSigner);
+  const observedIp = normalizeObservedIp(remoteAddress);
+  if (!observedIp) {
+    throw new GatewayUpstreamAdmissionError(422, "observed_ip_unavailable", "gateway could not identify an IPv4 peer address");
+  }
+  if (!observedIpAllowed(observedIp)) {
+    throw new GatewayUpstreamAdmissionError(403, "observed_ip_not_allowed", `observed upstream IP ${observedIp} is not allowed`);
+  }
+  const nonceKey = `${request.runtimeSigner.toLowerCase()}:${request.intentId}:${request.nonce}`;
+  pruneUpstreamAdmissionNonces();
+  if (upstreamAdmissionNonces.has(nonceKey)) {
+    throw new GatewayUpstreamAdmissionError(409, "nonce_replay", "upstream admission nonce has already been used");
+  }
+
+  const tlsResult = await verifyUpstreamTls(request, observedIp);
+  const now = new Date();
+  const expiresAt = new Date(Math.min(
+    now.getTime() + upstreamAdmissionTtlSeconds * 1000,
+    Number(request.deadline) * 1000
+  )).toISOString();
+  const unsignedObservation = {
+    version: 1 as const,
+    kind: "switchboard.gateway-upstream-observation" as const,
+    request,
+    requestDigest: digest,
+    observedIp,
+    observedPort: remotePort,
+    observedAt: now.toISOString(),
+    expiresAt,
+    tls: tlsResult
+  };
+  const observation = {
+    ...unsignedObservation,
+    admissionId: gatewayUpstreamAdmissionId(unsignedObservation)
+  };
+  const signature = await signReportPayload(reportSigningKey, GATEWAY_UPSTREAM_OBSERVATION_DOMAIN, observation, {
+    scheme: reportSigningScheme,
+    ss58Format: reportSigningSs58Format
+  });
+  const admission: StoredGatewayUpstreamAdmission = {
+    observation,
+    signature,
+    requestSignature: normalizedRequestSignature
+  };
+  upstreamAdmissions.set(observation.admissionId, admission);
+  upstreamAdmissionNonces.set(nonceKey, Date.parse(expiresAt));
+  return admission;
+}
+
+function parseGatewayUpstreamAdmissionPayload(input: unknown): GatewayUpstreamAdmissionPayload {
+  const record = objectRecord(input, "upstream admission payload");
+  return {
+    intentId: stringField(record, "intentId"),
+    sessionId: stringField(record, "sessionId"),
+    runtimeSigner: stringField(record, "runtimeSigner"),
+    operatorId: stringField(record, "operatorId"),
+    gatewayId: stringField(record, "gatewayId"),
+    processorId: stringField(record, "processorId"),
+    hostname: stringField(record, "hostname"),
+    validationHostname: optionalStringRecordField(record, "validationHostname"),
+    upstreamPort: numberRecordField(record, "upstreamPort"),
+    nonce: stringField(record, "nonce"),
+    deadline: stringField(record, "deadline")
+  };
+}
+
 async function legacyRouteIntentUpsert(authorization: string | undefined, body: unknown, reply: any) {
   if (!routeIntentAuthorized(authorization)) {
     return reply.code(401).send({ error: "unauthorized" });
   }
-  const route = normalizeRouteIntent(body as Parameters<typeof normalizeRouteIntent>[0]);
+  const parsedRoute = normalizeRouteIntent(body as Parameters<typeof normalizeRouteIntent>[0]);
+  const route = routeWithGatewayUpstreamAdmission(parsedRoute);
+  if (!route) {
+    return reply.code(409).send({ error: "gateway_upstream_admission_required" });
+  }
   routes.set(route.routeId, route);
   await persistAndRender();
 
@@ -638,7 +807,10 @@ async function ensureManagerInventoriesFresh(): Promise<void> {
   if (!processorDiscoveryEnabled || advertisedManagerIds.length === 0) {
     return;
   }
-  const stale = Date.now() - managerInventoryRefreshStartedAt >= processorDiscoveryIntervalMs;
+  expireStaleManagerInventoryRefresh();
+  const stale = managerInventoryRefreshedAt
+    ? Date.now() - Date.parse(managerInventoryRefreshedAt) >= processorDiscoveryIntervalMs
+    : true;
   if (managerInventories.size > 0 && !stale) {
     return;
   }
@@ -649,19 +821,63 @@ async function refreshManagerInventories(): Promise<void> {
   if (!processorDiscoveryEnabled || advertisedManagerIds.length === 0) {
     return;
   }
+  expireStaleManagerInventoryRefresh();
   if (managerInventoryRefresh) {
-    await managerInventoryRefresh;
+    await managerInventoryRefresh.promise;
     return;
   }
 
-  managerInventoryRefreshStartedAt = Date.now();
-  managerInventoryRefresh = doRefreshManagerInventories().finally(() => {
-    managerInventoryRefresh = undefined;
+  const generation = managerInventoryRefreshGeneration + 1;
+  managerInventoryRefreshGeneration = generation;
+  const startedAtMs = Date.now();
+  const refresh = {
+    generation,
+    startedAtMs,
+    startedAt: new Date(startedAtMs).toISOString(),
+    promise: runManagerInventoryRefreshWithTimeout(generation)
+  };
+  refresh.promise = refresh.promise.finally(() => {
+    if (managerInventoryRefresh?.generation === generation) {
+      managerInventoryRefresh = undefined;
+    }
   });
-  await managerInventoryRefresh;
+  managerInventoryRefresh = refresh;
+  await refresh.promise;
 }
 
-async function doRefreshManagerInventories(): Promise<void> {
+async function runManagerInventoryRefreshWithTimeout(generation: number): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<void>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`manager processor inventory refresh exceeded ${processorDiscoveryTimeoutMs}ms`));
+    }, processorDiscoveryTimeoutMs);
+    timeout.unref();
+  });
+  try {
+    await Promise.race([doRefreshManagerInventories(generation), timeoutPromise]);
+  } catch (error) {
+    if (!managerInventoryRefreshGenerationCurrent(generation)) {
+      return;
+    }
+    managerInventoryRefreshGeneration += 1;
+    managerInventoryError = error instanceof Error ? error.message : String(error);
+    managerInventoryRefreshTimedOutCount += 1;
+    app.log.warn(
+      {
+        generation,
+        error: managerInventoryError,
+        timeoutMs: processorDiscoveryTimeoutMs
+      },
+      "manager processor inventory refresh timed out"
+    );
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function doRefreshManagerInventories(generation: number): Promise<void> {
   const rpcUrl = rpcForAcurastNetwork(acurastNetwork, acurastRpcUrl);
   const api = await createAcurastApi({ network: acurastNetwork, rpcUrl });
   try {
@@ -681,6 +897,9 @@ async function doRefreshManagerInventories(): Promise<void> {
         })
       );
     }
+    if (!managerInventoryRefreshGenerationCurrent(generation)) {
+      return;
+    }
     managerInventories.clear();
     for (const [managerId, inventory] of next) {
       managerInventories.set(managerId, inventory);
@@ -699,6 +918,9 @@ async function doRefreshManagerInventories(): Promise<void> {
       "manager processor inventory refreshed"
     );
   } catch (error) {
+    if (!managerInventoryRefreshGenerationCurrent(generation)) {
+      return;
+    }
     managerInventoryError = error instanceof Error ? error.message : String(error);
     app.log.warn(
       {
@@ -709,6 +931,33 @@ async function doRefreshManagerInventories(): Promise<void> {
   } finally {
     await api.disconnect();
   }
+}
+
+function expireStaleManagerInventoryRefresh(nowMs = Date.now()): void {
+  if (!managerInventoryRefresh) {
+    return;
+  }
+  const ageMs = nowMs - managerInventoryRefresh.startedAtMs;
+  if (ageMs <= processorDiscoveryTimeoutMs) {
+    return;
+  }
+  const staleGeneration = managerInventoryRefresh.generation;
+  managerInventoryRefresh = undefined;
+  managerInventoryRefreshGeneration += 1;
+  managerInventoryError = `manager processor inventory refresh generation ${staleGeneration} exceeded ${processorDiscoveryTimeoutMs}ms`;
+  managerInventoryRefreshTimedOutCount += 1;
+  app.log.warn(
+    {
+      generation: staleGeneration,
+      ageMs,
+      timeoutMs: processorDiscoveryTimeoutMs
+    },
+    "manager processor inventory refresh expired stale generation"
+  );
+}
+
+function managerInventoryRefreshGenerationCurrent(generation: number): boolean {
+  return generation === managerInventoryRefreshGeneration;
 }
 
 function processorsForManagerScope(managerId: string): string[] | undefined {
@@ -750,6 +999,8 @@ function processorRefSetHas(refs: string[], processor: string): boolean {
 function processorDiscoveryHealth() {
   const refreshedAtMs = managerInventoryRefreshedAt ? Date.parse(managerInventoryRefreshedAt) : undefined;
   const fresh = managerInventoryFresh();
+  const refresh = managerInventoryRefresh;
+  const nowMs = Date.now();
   return {
     enabled: processorDiscoveryEnabled,
     network: acurastNetwork,
@@ -761,13 +1012,16 @@ function processorDiscoveryHealth() {
     checkAvailability: processorDiscoveryAvailability,
     startDelayMs: processorDiscoveryStartDelayMs,
     durationMs: processorDiscoveryDurationMs,
+    timeoutMs: processorDiscoveryTimeoutMs,
     limit: processorDiscoveryLimit,
     includeProcessors: advertisedProcessors,
     excludeProcessors: excludedProcessors,
-    refreshInFlight: Boolean(managerInventoryRefresh),
-    refreshStartedAt: managerInventoryRefreshStartedAt > 0 ? new Date(managerInventoryRefreshStartedAt).toISOString() : undefined,
+    refreshInFlight: Boolean(refresh),
+    refreshStartedAt: refresh?.startedAt,
+    refreshAgeMs: refresh ? nowMs - refresh.startedAtMs : undefined,
+    refreshTimedOutCount: managerInventoryRefreshTimedOutCount,
     refreshedAt: managerInventoryRefreshedAt,
-    staleAfterMs: refreshedAtMs === undefined ? undefined : Math.max(0, refreshedAtMs + processorDiscoveryIntervalMs + 30_000 - Date.now()),
+    staleAfterMs: refreshedAtMs === undefined ? undefined : Math.max(0, refreshedAtMs + processorDiscoveryIntervalMs + 30_000 - nowMs),
     error: managerInventoryError,
     lastError: managerInventoryError,
     inventories: [...managerInventories.values()].map((inventory) => ({
@@ -839,10 +1093,16 @@ function reportedProcessorCount(): number | undefined {
 async function loadState(): Promise<void> {
   try {
     const raw = await fs.readFile(stateFile, "utf8");
-    const parsed = JSON.parse(raw) as { routes?: unknown[] };
+    const parsed = JSON.parse(raw) as { routes?: unknown[]; upstreamAdmissions?: unknown[] };
     for (const item of parsed.routes ?? []) {
       const route = normalizeRouteIntent(item as Parameters<typeof normalizeRouteIntent>[0]);
       routes.set(route.routeId, route);
+    }
+    for (const item of parsed.upstreamAdmissions ?? []) {
+      const admission = item as StoredGatewayUpstreamAdmission;
+      if (admission?.observation?.admissionId && Date.parse(admission.observation.expiresAt) > Date.now()) {
+        upstreamAdmissions.set(admission.observation.admissionId, admission);
+      }
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -1076,9 +1336,49 @@ function desiredRoutesFromRouteState(input: Record<string, unknown>): Map<string
     if (routeOperatorId !== responseOperatorId || routeGatewayId !== responseGatewayId) {
       continue;
     }
-    desired.set(route.routeId, route);
+    const admittedRoute = routeWithGatewayUpstreamAdmission(route);
+    if (!admittedRoute) {
+      continue;
+    }
+    desired.set(admittedRoute.routeId, admittedRoute);
   }
   return desired;
+}
+
+function routeWithGatewayUpstreamAdmission(route: RouteIntent): RouteIntent | undefined {
+  const source = route.source && typeof route.source === "object" && !Array.isArray(route.source)
+    ? route.source as Record<string, unknown>
+    : {};
+  if (source.mode !== "deployment-intent-route-reconciler") {
+    return route;
+  }
+  const admissionId = typeof source.upstreamAdmissionId === "string" ? source.upstreamAdmissionId : undefined;
+  if (!admissionId) {
+    return undefined;
+  }
+  const admission = upstreamAdmissions.get(admissionId);
+  if (!admission || Date.parse(admission.observation.expiresAt) <= Date.now()) {
+    upstreamAdmissions.delete(admissionId);
+    return undefined;
+  }
+  const request = admission.observation.request;
+  if (
+    request.sessionId.toLowerCase() !== route.sessionId.toLowerCase() ||
+    request.gatewayId !== gatewayId ||
+    request.operatorId.toLowerCase() !== String(operatorId).toLowerCase() ||
+    request.upstreamPort !== route.upstreamPort
+  ) {
+    return undefined;
+  }
+  return normalizeRouteIntent({
+    ...route,
+    upstreamHost: admission.observation.observedIp,
+    source: {
+      ...source,
+      gatewayObservedIp: admission.observation.observedIp,
+      gatewayObservedAt: admission.observation.observedAt
+    }
+  });
 }
 
 function routeMapsEqual(left: Map<string, RouteIntent>, right: Map<string, RouteIntent>): boolean {
@@ -1096,7 +1396,8 @@ async function persistAndRender(): Promise<void> {
     `${JSON.stringify(
       {
         updatedAt: new Date().toISOString(),
-        routes: [...routes.values()]
+        routes: [...routes.values()],
+        upstreamAdmissions: freshUpstreamAdmissions()
       },
       null,
       2
@@ -1117,6 +1418,26 @@ function activeRoutes(): RouteIntent[] {
   return [...routes.values()].filter((route) => routeIsActive(route));
 }
 
+function freshUpstreamAdmissions(nowMs = Date.now()): StoredGatewayUpstreamAdmission[] {
+  const fresh = [];
+  for (const [admissionId, admission] of upstreamAdmissions.entries()) {
+    if (Date.parse(admission.observation.expiresAt) <= nowMs) {
+      upstreamAdmissions.delete(admissionId);
+      continue;
+    }
+    fresh.push(admission);
+  }
+  return fresh;
+}
+
+function pruneUpstreamAdmissionNonces(nowMs = Date.now()): void {
+  for (const [nonceKey, expiresAtMs] of upstreamAdmissionNonces.entries()) {
+    if (expiresAtMs <= nowMs) {
+      upstreamAdmissionNonces.delete(nonceKey);
+    }
+  }
+}
+
 function routeStatusReportFilters(query: unknown): RouteStatusReportFilters | undefined {
   if (!query || typeof query !== "object") {
     return undefined;
@@ -1127,6 +1448,113 @@ function routeStatusReportFilters(query: unknown): RouteStatusReportFilters | un
     sessionId: stringQueryField(record, "sessionId"),
     hostname: optionalNormalizedHostname(stringQueryField(record, "hostname"))
   };
+}
+
+function normalizeObservedIp(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value;
+  return isIP(normalized) === 4 ? normalized : undefined;
+}
+
+function observedIpAllowed(value: string): boolean {
+  if (upstreamAdmissionAllowedCidrs.length > 0) {
+    return upstreamAdmissionAllowedCidrs.some((cidr) => ipv4InCidr(value, cidr));
+  }
+  return publicIpv4Address(value) || privateIpv4Address(value);
+}
+
+function privateIpv4Address(value: string): boolean {
+  const octets = ipv4Octets(value);
+  if (!octets) return false;
+  const [a, b] = octets;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+function publicIpv4Address(value: string): boolean {
+  const octets = ipv4Octets(value);
+  if (!octets) return false;
+  const [a, b, c, d] = octets;
+  if (a === 0 || a === 10 || a === 127) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 192 && b === 0 && c === 0) return false;
+  if (a === 192 && b === 0 && c === 2) return false;
+  if (a === 198 && (b === 18 || b === 19)) return false;
+  if (a === 198 && b === 51 && c === 100) return false;
+  if (a === 203 && b === 0 && c === 113) return false;
+  if (a >= 224) return false;
+  if (a === 255 && b === 255 && c === 255 && d === 255) return false;
+  return true;
+}
+
+function ipv4InCidr(value: string, cidr: string): boolean {
+  const [range, rawPrefix] = cidr.split("/");
+  const prefix = rawPrefix === undefined ? 32 : Number(rawPrefix);
+  const ip = ipv4ToUint32(value);
+  const base = ipv4ToUint32(range);
+  if (ip === undefined || base === undefined || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+    return false;
+  }
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (ip & mask) === (base & mask);
+}
+
+function ipv4ToUint32(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const octets = ipv4Octets(value);
+  if (!octets) return undefined;
+  return (((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3]) >>> 0;
+}
+
+function ipv4Octets(value: string): [number, number, number, number] | undefined {
+  if (isIP(value) !== 4) return undefined;
+  const octets = value.split(".").map((part) => Number(part));
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return undefined;
+  }
+  return octets as [number, number, number, number];
+}
+
+async function verifyUpstreamTls(
+  request: GatewayUpstreamAdmissionPayload,
+  observedIp: string
+): Promise<StoredGatewayUpstreamAdmission["observation"]["tls"]> {
+  const servername = request.validationHostname ?? request.hostname;
+  if (!upstreamAdmissionTlsProbeEnabled) {
+    return { verified: false, servername, skipped: true };
+  }
+  const ca = upstreamAdmissionCaFile ? await fs.readFile(upstreamAdmissionCaFile, "utf8") : undefined;
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({
+      host: observedIp,
+      port: request.upstreamPort,
+      servername,
+      ca,
+      rejectUnauthorized: true,
+      timeout: upstreamAdmissionTlsProbeTimeoutMs
+    });
+    socket.once("secureConnect", () => {
+      const authorizationError = socket.authorizationError ? String(socket.authorizationError) : undefined;
+      const verified = socket.authorized === true;
+      socket.destroy();
+      if (!verified) {
+        reject(new GatewayUpstreamAdmissionError(422, "upstream_tls_unverified", authorizationError ?? "upstream TLS was not authorized"));
+        return;
+      }
+      resolve({ verified, servername });
+    });
+    socket.once("timeout", () => {
+      socket.destroy();
+      reject(new GatewayUpstreamAdmissionError(504, "upstream_tls_probe_timeout", "upstream TLS probe timed out"));
+    });
+    socket.once("error", (error) => {
+      reject(new GatewayUpstreamAdmissionError(422, "upstream_tls_probe_failed", error.message));
+    });
+  });
 }
 
 function stringQueryField(record: Record<string, unknown>, name: string): string | undefined {
@@ -1154,6 +1582,19 @@ function stringField(input: Record<string, unknown>, name: string): string {
   const value = input[name];
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`route state ${name} missing`);
+  }
+  return value;
+}
+
+function optionalStringRecordField(input: Record<string, unknown>, name: string): string | undefined {
+  const value = input[name];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberRecordField(input: Record<string, unknown>, name: string): number {
+  const value = input[name];
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error(`${name} must be an integer`);
   }
   return value;
 }
