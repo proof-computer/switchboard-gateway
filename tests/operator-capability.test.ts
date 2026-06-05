@@ -168,6 +168,31 @@ describe("operator capability signer authorization", () => {
     assert.equal(stored.report.gateway.reportedProcessorCount, 0);
   });
 
+  it("verifies signed reports with relay-pull route-state admission counters", async () => {
+    const report = sampleReport();
+    report.gateway.upstreamAdmissionModes = ["relay-pull", "direct-post", "relay-pull"];
+    report.gateway.routeState = {
+      enabled: true,
+      url: "https://attacker.example/route-state",
+      lastCheckedAt: "2026-05-08T00:00:00.000Z",
+      lastSuccessAt: "2026-05-08T00:00:00.000Z",
+      polledRouteCount: 0,
+      desiredRouteCount: 0,
+      pendingUpstreamAdmissionRequestCount: 1,
+      acceptedUpstreamAdmissionCount: 2,
+      processedUpstreamAdmissionRequestCount: 3,
+      healthy: true,
+      staleAfterMs: 15000
+    };
+
+    const stored = await signedStoredReport(report);
+
+    assert.deepEqual(stored.report.gateway.upstreamAdmissionModes, ["relay-pull", "direct-post"]);
+    assert.equal(stored.report.gateway.routeState?.pendingUpstreamAdmissionRequestCount, 1);
+    assert.equal(stored.report.gateway.routeState?.acceptedUpstreamAdmissionCount, 2);
+    assert.equal(stored.report.gateway.routeState?.processedUpstreamAdmissionRequestCount, 3);
+  });
+
   it("strips legacy report route-intent URLs from new signed capability reports", async () => {
     const report = sampleReport();
     report.gateway.routeIntentUrl = "https://attacker.example/route-intents";

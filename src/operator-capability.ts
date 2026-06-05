@@ -73,6 +73,9 @@ const gatewayRouteStateStatusSchema = z.object({
   lastError: z.string().min(1).optional(),
   polledRouteCount: z.number().int().nonnegative().optional(),
   desiredRouteCount: z.number().int().nonnegative().optional(),
+  pendingUpstreamAdmissionRequestCount: z.number().int().nonnegative().optional(),
+  acceptedUpstreamAdmissionCount: z.number().int().nonnegative().optional(),
+  processedUpstreamAdmissionRequestCount: z.number().int().nonnegative().optional(),
   lastAppliedRouteIds: z.array(z.string().min(1)).max(500).optional(),
   lastRemovedRouteIds: z.array(z.string().min(1)).max(500).optional(),
   lastRemovalReason: z.string().min(1).optional(),
@@ -283,7 +286,10 @@ export function normalizeGatewayCapabilityReport(
   const normalizedGateway: GatewayCapabilityReport["gateway"] = {
     ...gateway,
     publicAddresses: uniqueStrings(report.gateway.publicAddresses ?? []),
-    supportedClasses: uniqueStrings(report.gateway.supportedClasses ?? [])
+    supportedClasses: uniqueStrings(report.gateway.supportedClasses ?? []),
+    upstreamAdmissionModes: report.gateway.upstreamAdmissionModes
+      ? operatorCapabilityUpstreamAdmissionModes(report)
+      : undefined
   };
   if (options.preserveLegacyRouteIntentUrl && legacyRouteIntentUrl) {
     normalizedGateway.routeIntentUrl = legacyRouteIntentUrl;
