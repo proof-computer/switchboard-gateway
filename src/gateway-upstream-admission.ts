@@ -2,6 +2,7 @@ import { ethers } from "ethers";
 
 export const GATEWAY_UPSTREAM_ADMISSION_REQUEST_DOMAIN = "switchboard.gateway-upstream-admission.v1";
 export const GATEWAY_UPSTREAM_OBSERVATION_DOMAIN = "switchboard.gateway-upstream-observation.v1";
+export const GATEWAY_UPSTREAM_PROBE_RESPONSE_DOMAIN = "switchboard.gateway-upstream-probe-response.v1";
 
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
 const SECP256K1_HALF_N = SECP256K1_N / 2n;
@@ -51,6 +52,23 @@ export interface SignedGatewayUpstreamObservation {
   };
 }
 
+export interface GatewayUpstreamProbeResponsePayload {
+  version: 1;
+  kind: "switchboard.gateway-upstream-probe-response";
+  requestDigest: string;
+  gatewayNonce: string;
+  intentId: string;
+  sessionId: string;
+  runtimeSigner: string;
+  upstreamPort: number;
+  signedAt: string;
+}
+
+export interface SignedGatewayUpstreamProbeResponse {
+  probe: GatewayUpstreamProbeResponsePayload;
+  signature: string;
+}
+
 export function normalizeGatewayUpstreamAdmissionPayload(
   payload: GatewayUpstreamAdmissionPayload
 ): GatewayUpstreamAdmissionPayload {
@@ -92,6 +110,22 @@ export function normalizeGatewayUpstreamObservationPayload(
   };
 }
 
+export function normalizeGatewayUpstreamProbeResponsePayload(
+  payload: GatewayUpstreamProbeResponsePayload
+): GatewayUpstreamProbeResponsePayload {
+  return {
+    version: 1,
+    kind: "switchboard.gateway-upstream-probe-response",
+    requestDigest: ethers.hexlify(payload.requestDigest),
+    gatewayNonce: String(payload.gatewayNonce),
+    intentId: payload.intentId.trim(),
+    sessionId: ethers.hexlify(payload.sessionId),
+    runtimeSigner: ethers.getAddress(payload.runtimeSigner),
+    upstreamPort: Number(payload.upstreamPort),
+    signedAt: payload.signedAt
+  };
+}
+
 export function gatewayUpstreamAdmissionDigest(payload: GatewayUpstreamAdmissionPayload): string {
   return ethers.keccak256(ethers.toUtf8Bytes(canonicalJson({
     domain: GATEWAY_UPSTREAM_ADMISSION_REQUEST_DOMAIN,
@@ -103,6 +137,13 @@ export function gatewayUpstreamObservationDigest(payload: GatewayUpstreamObserva
   return ethers.keccak256(ethers.toUtf8Bytes(canonicalJson({
     domain: GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
     payload: normalizeGatewayUpstreamObservationPayload(payload)
+  })));
+}
+
+export function gatewayUpstreamProbeResponseDigest(payload: GatewayUpstreamProbeResponsePayload): string {
+  return ethers.keccak256(ethers.toUtf8Bytes(canonicalJson({
+    domain: GATEWAY_UPSTREAM_PROBE_RESPONSE_DOMAIN,
+    payload: normalizeGatewayUpstreamProbeResponsePayload(payload)
   })));
 }
 
@@ -124,6 +165,13 @@ export function recoverGatewayUpstreamAdmissionSigner(
   signature: string
 ): string {
   return ethers.recoverAddress(gatewayUpstreamAdmissionDigest(payload), signature);
+}
+
+export function recoverGatewayUpstreamProbeResponseSigner(
+  payload: GatewayUpstreamProbeResponsePayload,
+  signature: string
+): string {
+  return ethers.recoverAddress(gatewayUpstreamProbeResponseDigest(payload), signature);
 }
 
 export function normalizeSecp256k1SignatureForDigest(

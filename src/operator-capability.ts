@@ -46,6 +46,7 @@ const operatorEconomicsSchema = z.object({
 }).optional();
 
 const uintString = z.string().regex(/^[0-9]+$/);
+const gatewayUpstreamAdmissionModeSchema = z.enum(["direct-post", "relay-pull"]);
 
 const gatewayRouteMetricsSchema = z.object({
   routeId: z.string().min(1).max(160).optional(),
@@ -113,6 +114,7 @@ export const gatewayCapabilityReportSchema = z.object({
     reportedProcessorCount: z.number().int().nonnegative().optional(),
     softwareVersion: z.string().min(1).optional(),
     supportedClasses: z.array(z.string().min(1)).default([]),
+    upstreamAdmissionModes: z.array(gatewayUpstreamAdmissionModeSchema).optional(),
     routeState: gatewayRouteStateStatusSchema.optional(),
     routeMetrics: z.array(gatewayRouteMetricsSchema).max(500).optional()
   }),
@@ -152,6 +154,7 @@ export const operatorProfileSchema = z.object({
 });
 
 export type ProcessorScope = z.output<typeof processorScopeSchema>;
+export type GatewayUpstreamAdmissionMode = z.output<typeof gatewayUpstreamAdmissionModeSchema>;
 export type GatewayCapabilityReport = z.output<typeof gatewayCapabilityReportSchema>;
 export type SignedGatewayCapabilityReport = z.output<typeof signedGatewayCapabilityReportSchema>;
 export type OperatorProfile = z.output<typeof operatorProfileSchema>;
@@ -193,6 +196,7 @@ export interface OperatorCapabilityCandidate {
   routeStateUrl?: string;
   routeIntentUrl?: string;
   upstreamAdmissionUrl?: string;
+  upstreamAdmissionModes: GatewayUpstreamAdmissionMode[];
   routeIntentTokenEnv?: string;
   selectionReasons: string[];
 }
@@ -427,6 +431,7 @@ export function selectOperatorCapabilityCandidate(
     routeStateUrl?: string;
     routeIntentUrl?: string;
     upstreamAdmissionUrl?: string;
+    upstreamAdmissionModes: GatewayUpstreamAdmissionMode[];
     processors: ReturnType<typeof expandedReportProcessors>;
   }> = [];
 
@@ -461,6 +466,7 @@ export function selectOperatorCapabilityCandidate(
     }
     const routeIntentUrl = operatorCapabilityRouteIntentUrl(profile, report);
     const upstreamAdmissionUrl = operatorProfileUpstreamAdmissionUrlForGateway(profile, report.operator.gatewayId);
+    const upstreamAdmissionModes = operatorCapabilityUpstreamAdmissionModes(report);
     if (input.requireRouteIntentSink && !routeIntentUrl) {
       continue;
     }
@@ -482,6 +488,7 @@ export function selectOperatorCapabilityCandidate(
       routeStateUrl,
       routeIntentUrl,
       upstreamAdmissionUrl,
+      upstreamAdmissionModes,
       processors
     });
   }
@@ -519,6 +526,7 @@ export function selectOperatorCapabilityCandidate(
       routeStateUrl: candidate.routeStateUrl,
       routeIntentUrl: candidate.routeIntentUrl,
       upstreamAdmissionUrl: candidate.upstreamAdmissionUrl,
+      upstreamAdmissionModes: candidate.upstreamAdmissionModes,
       routeIntentTokenEnv: candidate.profile.routeIntentTokenEnv,
       selectionReasons: [
         "operator-profile-active",
@@ -532,6 +540,13 @@ export function selectOperatorCapabilityCandidate(
   }
 
   return undefined;
+}
+
+export function operatorCapabilityUpstreamAdmissionModes(
+  report: GatewayCapabilityReport
+): GatewayUpstreamAdmissionMode[] {
+  return uniqueStrings(report.gateway.upstreamAdmissionModes?.length ? report.gateway.upstreamAdmissionModes : ["direct-post"])
+    .filter((mode): mode is GatewayUpstreamAdmissionMode => mode === "direct-post" || mode === "relay-pull");
 }
 
 function publicAddressFingerprint(publicAddresses: string[]): string {

@@ -1,4 +1,6 @@
+import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
+import https from "node:https";
 import { isIP } from "node:net";
 import path from "node:path";
 import tls from "node:tls";
@@ -17,7 +19,7 @@ import {
 import { normalizeHostname, normalizeRouteIntent, routeHostnames, routeIsActive, type RouteIntent } from "./route-intent.js";
 import { collectEnvoyRouteMetrics } from "./route-metrics.js";
 import { buildRouteStatusReport, type RouteStatusReportFilters } from "./route-status-report.js";
-import { signReportPayload } from "./report-signing.js";
+import { signReportPayload, verifyReportSignature } from "./report-signing.js";
 import { renderFileXds } from "./xds.js";
 import { processorRefToId, signGatewayCapabilityReport, type GatewayCapabilityReport } from "./operator-capability.js";
 import { fetchWanIpv4, normalizeOperatorPublicAddressMode, type OperatorPublicAddressMode } from "./wan-ip.js";
@@ -26,10 +28,15 @@ import {
   gatewayUpstreamAdmissionDigest,
   gatewayUpstreamAdmissionId,
   normalizeGatewayUpstreamAdmissionPayload,
+  normalizeGatewayUpstreamObservationPayload,
+  normalizeGatewayUpstreamProbeResponsePayload,
   normalizeSecp256k1SignatureForDigest,
+  recoverGatewayUpstreamProbeResponseSigner,
   type GatewayUpstreamAdmissionPayload,
   type SignedGatewayUpstreamObservation
 } from "./gateway-upstream-admission.js";
+
+const SWITCHBOARD_UPSTREAM_ADMISSION_PATH = "/.well-known/proofcomputer/upstream-admission";
 
 const port = numberEnv("GATEWAY_AGENT_PORT", 18080);
 const host = process.env.GATEWAY_AGENT_HOST ?? "0.0.0.0";
@@ -137,6 +144,9 @@ interface RouteStateStatus {
   lastError?: string;
   polledRouteCount?: number;
   desiredRouteCount?: number;
+  pendingUpstreamAdmissionRequestCount?: number;
+  acceptedUpstreamAdmissionCount?: number;
+  processedUpstreamAdmissionRequestCount?: number;
   lastAppliedRouteIds?: string[];
   lastRemovedRouteIds?: string[];
   lastRemovalReason?: string;
@@ -183,6 +193,13 @@ let publicAddressState: {
 
 interface StoredGatewayUpstreamAdmission extends SignedGatewayUpstreamObservation {
   requestSignature: string;
+}
+
+interface PulledGatewayUpstreamAdmissionRequest {
+  requestDigest: string;
+  request: GatewayUpstreamAdmissionPayload;
+  requestSignature: string;
+  candidateUpstreamIps: string[];
 }
 
 const app = Fastify({
@@ -359,21 +376,47 @@ async function admitGatewayUpstream(
   }
 
   const tlsResult = await verifyUpstreamTls(request, observedIp);
+  return signAndStoreGatewayUpstreamAdmission({
+    request,
+    requestDigest: digest,
+    requestSignature: normalizedRequestSignature,
+    observedIp,
+    ...(remotePort === undefined ? {} : { observedPort: remotePort }),
+    tls: tlsResult
+  });
+}
+
+async function signAndStoreGatewayUpstreamAdmission(input: {
+  request: GatewayUpstreamAdmissionPayload;
+  requestDigest: string;
+  requestSignature: string;
+  observedIp: string;
+  observedPort?: number;
+  tls: StoredGatewayUpstreamAdmission["observation"]["tls"];
+}): Promise<StoredGatewayUpstreamAdmission> {
+  if (!reportSigningKey || !reportSigningScheme) {
+    throw new GatewayUpstreamAdmissionError(503, "gateway_observation_signing_unavailable", "gateway report signing is required");
+  }
+  const nonceKey = `${input.request.runtimeSigner.toLowerCase()}:${input.request.intentId}:${input.request.nonce}`;
+  pruneUpstreamAdmissionNonces();
+  if (upstreamAdmissionNonces.has(nonceKey)) {
+    throw new GatewayUpstreamAdmissionError(409, "nonce_replay", "upstream admission nonce has already been used");
+  }
   const now = new Date();
   const expiresAt = new Date(Math.min(
     now.getTime() + upstreamAdmissionTtlSeconds * 1000,
-    Number(request.deadline) * 1000
+    Number(input.request.deadline) * 1000
   )).toISOString();
   const unsignedObservation = {
     version: 1 as const,
     kind: "switchboard.gateway-upstream-observation" as const,
-    request,
-    requestDigest: digest,
-    observedIp,
-    observedPort: remotePort,
+    request: input.request,
+    requestDigest: input.requestDigest,
+    observedIp: input.observedIp,
+    ...(input.observedPort === undefined ? {} : { observedPort: input.observedPort }),
     observedAt: now.toISOString(),
     expiresAt,
-    tls: tlsResult
+    tls: input.tls
   };
   const observation = {
     ...unsignedObservation,
@@ -386,7 +429,7 @@ async function admitGatewayUpstream(
   const admission: StoredGatewayUpstreamAdmission = {
     observation,
     signature,
-    requestSignature: normalizedRequestSignature
+    requestSignature: input.requestSignature
   };
   upstreamAdmissions.set(observation.admissionId, admission);
   upstreamAdmissionNonces.set(nonceKey, Date.parse(expiresAt));
@@ -583,6 +626,7 @@ async function buildSignedGatewayCapabilityReport() {
       reportedProcessorCount: reportedProcessorCount(),
       softwareVersion: process.env.PROOF_OPERATOR_SOFTWARE_VERSION,
       supportedClasses,
+      upstreamAdmissionModes: ["direct-post", "relay-pull"],
       routeStateHealthy: routeStateUrl ? routeStateHealthy() : undefined,
       routeStateLastSuccessAt: routeStateStatus.lastSuccessAt,
       routeState: routeStateHealthStatus(),
@@ -1165,13 +1209,21 @@ async function doPollRouteState(generation: number, signal: AbortSignal): Promis
     if (!routeStateGenerationCurrent(generation)) {
       return;
     }
+    const acceptedUpstreamAdmissionCount = Array.isArray(state.acceptedUpstreamAdmissions) ? state.acceptedUpstreamAdmissions.length : 0;
+    const pendingUpstreamAdmissionRequestCount = Array.isArray(state.upstreamAdmissionRequests) ? state.upstreamAdmissionRequests.length : 0;
+    const hydratedAdmissionCount = await hydrateAcceptedUpstreamAdmissions(state);
+    const processedUpstreamAdmissionRequestCount = await processPulledUpstreamAdmissionRequests(state);
+    if (!routeStateGenerationCurrent(generation)) {
+      return;
+    }
     const polledRoutes = desiredRoutesFromRouteState(state);
     const desiredRoutes = routesWithRemovalGrace(polledRoutes, Date.now());
     const beforeIds = [...routes.keys()].sort();
     const afterIds = [...desiredRoutes.keys()].sort();
     const removedIds = beforeIds.filter((routeId) => !desiredRoutes.has(routeId));
     const completedAt = new Date().toISOString();
-    if (!routeMapsEqual(routes, desiredRoutes)) {
+    const admissionCacheChanged = hydratedAdmissionCount > 0 || processedUpstreamAdmissionRequestCount > 0;
+    if (!routeMapsEqual(routes, desiredRoutes) || admissionCacheChanged) {
       routes.clear();
       for (const route of desiredRoutes.values()) {
         routes.set(route.routeId, route);
@@ -1189,6 +1241,9 @@ async function doPollRouteState(generation: number, signal: AbortSignal): Promis
         lastError: undefined,
         polledRouteCount: polledRoutes.size,
         desiredRouteCount: desiredRoutes.size,
+        pendingUpstreamAdmissionRequestCount,
+        acceptedUpstreamAdmissionCount,
+        processedUpstreamAdmissionRequestCount,
         lastAppliedRouteIds: afterIds,
         lastRemovedRouteIds: removedIds,
         lastRemovalReason: removedIds.length > 0 ? "route_state_omitted_after_grace" : undefined,
@@ -1206,6 +1261,9 @@ async function doPollRouteState(generation: number, signal: AbortSignal): Promis
       lastError: undefined,
       polledRouteCount: polledRoutes.size,
       desiredRouteCount: desiredRoutes.size,
+      pendingUpstreamAdmissionRequestCount,
+      acceptedUpstreamAdmissionCount,
+      processedUpstreamAdmissionRequestCount,
       configVersion: configVersion.toString(),
       consecutiveFailures: 0
     };
@@ -1273,6 +1331,208 @@ async function fetchRouteState(signal: AbortSignal): Promise<Record<string, unkn
   } finally {
     clearTimeout(timeout);
     signal.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+async function hydrateAcceptedUpstreamAdmissions(input: Record<string, unknown>): Promise<number> {
+  if (!Array.isArray(input.acceptedUpstreamAdmissions)) {
+    return 0;
+  }
+  let hydrated = 0;
+  for (const item of input.acceptedUpstreamAdmissions) {
+    try {
+      const admission = await parseAcceptedUpstreamAdmission(item);
+      if (!gatewayUpstreamAdmissionMatchesThisGateway(admission.observation.request)) {
+        continue;
+      }
+      if (Date.parse(admission.observation.expiresAt) <= Date.now()) {
+        continue;
+      }
+      if (upstreamAdmissions.has(admission.observation.admissionId)) {
+        continue;
+      }
+      upstreamAdmissions.set(admission.observation.admissionId, admission);
+      hydrated += 1;
+    } catch (error) {
+      app.log.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "gateway ignored invalid accepted upstream admission from route state"
+      );
+    }
+  }
+  return hydrated;
+}
+
+async function processPulledUpstreamAdmissionRequests(input: Record<string, unknown>): Promise<number> {
+  if (!Array.isArray(input.upstreamAdmissionRequests)) {
+    return 0;
+  }
+  let processed = 0;
+  for (const item of input.upstreamAdmissionRequests) {
+    let pulled: PulledGatewayUpstreamAdmissionRequest;
+    try {
+      pulled = parsePulledUpstreamAdmissionRequest(item);
+    } catch (error) {
+      app.log.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        "gateway ignored invalid upstream admission request from route state"
+      );
+      continue;
+    }
+    if (!gatewayUpstreamAdmissionMatchesThisGateway(pulled.request)) {
+      continue;
+    }
+    if (Number(pulled.request.deadline) <= Math.floor(Date.now() / 1000)) {
+      continue;
+    }
+    const existing = freshUpstreamAdmissionForRequestDigest(pulled.requestDigest);
+    if (existing) {
+      try {
+        await submitGatewayPulledUpstreamAdmission(existing);
+        processed += 1;
+      } catch (error) {
+        app.log.warn(
+          {
+            requestDigest: pulled.requestDigest,
+            error: error instanceof Error ? error.message : String(error)
+          },
+          "gateway failed to resubmit cached upstream admission"
+        );
+      }
+      continue;
+    }
+
+    const candidateIps = pulled.candidateUpstreamIps.filter((candidateIp) => observedIpAllowed(candidateIp));
+    if (candidateIps.length === 0) {
+      app.log.warn(
+        { requestDigest: pulled.requestDigest, candidateUpstreamIps: pulled.candidateUpstreamIps },
+        "gateway upstream admission request had no allowed candidate IPs"
+      );
+      continue;
+    }
+    for (const candidateIp of candidateIps) {
+      try {
+        const admission = await admitPulledGatewayUpstream(pulled, candidateIp);
+        await submitGatewayPulledUpstreamAdmission(admission);
+        processed += 1;
+        app.log.info(
+          {
+            admissionId: admission.observation.admissionId,
+            requestDigest: pulled.requestDigest,
+            observedIp: admission.observation.observedIp,
+            upstreamPort: pulled.request.upstreamPort
+          },
+          "gateway pulled upstream admission accepted"
+        );
+        break;
+      } catch (error) {
+        app.log.warn(
+          {
+            requestDigest: pulled.requestDigest,
+            candidateIp,
+            error: error instanceof Error ? error.message : String(error)
+          },
+          "gateway upstream admission candidate failed"
+        );
+      }
+    }
+  }
+  return processed;
+}
+
+async function parseAcceptedUpstreamAdmission(input: unknown): Promise<StoredGatewayUpstreamAdmission> {
+  const record = objectRecord(input, "accepted upstream admission");
+  const request = normalizeGatewayUpstreamAdmissionPayload(parseGatewayUpstreamAdmissionPayload(record.request));
+  const requestDigest = gatewayUpstreamAdmissionDigest(request);
+  const requestSignature = normalizeSecp256k1SignatureForDigest(
+    stringField(record, "requestSignature"),
+    requestDigest,
+    request.runtimeSigner
+  );
+  const observation = normalizeGatewayUpstreamObservationPayload(
+    objectRecord(record.observation, "upstream admission observation") as unknown as SignedGatewayUpstreamObservation["observation"]
+  );
+  if (observation.requestDigest.toLowerCase() !== requestDigest.toLowerCase()) {
+    throw new Error("accepted upstream admission request digest mismatch");
+  }
+  if (JSON.stringify(observation.request) !== JSON.stringify(request)) {
+    throw new Error("accepted upstream admission request mismatch");
+  }
+  const signature = objectRecord(record.observationSignature, "upstream admission observation signature") as SignedGatewayUpstreamObservation["signature"];
+  if (signature.domain !== GATEWAY_UPSTREAM_OBSERVATION_DOMAIN) {
+    throw new Error(`accepted upstream admission signature domain mismatch: ${signature.domain}`);
+  }
+  await verifyReportSignature(observation, signature);
+  return {
+    requestSignature,
+    observation,
+    signature
+  };
+}
+
+function parsePulledUpstreamAdmissionRequest(input: unknown): PulledGatewayUpstreamAdmissionRequest {
+  const record = objectRecord(input, "upstream admission request");
+  const request = normalizeGatewayUpstreamAdmissionPayload(parseGatewayUpstreamAdmissionPayload(record.request));
+  const requestDigest = stringField(record, "requestDigest");
+  const actualDigest = gatewayUpstreamAdmissionDigest(request);
+  if (requestDigest.toLowerCase() !== actualDigest.toLowerCase()) {
+    throw new Error("upstream admission request digest mismatch");
+  }
+  const requestSignature = normalizeSecp256k1SignatureForDigest(
+    stringField(record, "requestSignature"),
+    actualDigest,
+    request.runtimeSigner
+  );
+  return {
+    requestDigest: actualDigest,
+    request,
+    requestSignature,
+    candidateUpstreamIps: normalizeCandidateUpstreamIps(record.candidateUpstreamIps)
+  };
+}
+
+async function admitPulledGatewayUpstream(
+  pulled: PulledGatewayUpstreamAdmissionRequest,
+  observedIp: string
+): Promise<StoredGatewayUpstreamAdmission> {
+  if (!observedIpAllowed(observedIp)) {
+    throw new GatewayUpstreamAdmissionError(403, "observed_ip_not_allowed", `observed upstream IP ${observedIp} is not allowed`);
+  }
+  const tlsResult = await verifyUpstreamTls(pulled.request, observedIp);
+  await verifyRuntimeUpstreamProbe(pulled.request, pulled.requestDigest, observedIp);
+  return signAndStoreGatewayUpstreamAdmission({
+    request: pulled.request,
+    requestDigest: pulled.requestDigest,
+    requestSignature: pulled.requestSignature,
+    observedIp,
+    tls: tlsResult
+  });
+}
+
+async function submitGatewayPulledUpstreamAdmission(admission: StoredGatewayUpstreamAdmission): Promise<void> {
+  if (!routeStateUrl || !operatorId || !gatewayId) {
+    throw new Error("route-state relay endpoint is unavailable");
+  }
+  const submitUrl = new URL(
+    `/v1/operators/${encodeURIComponent(operatorId.toLowerCase())}/gateways/${encodeURIComponent(gatewayId)}/upstream-admissions`,
+    routeStateUrl
+  );
+  const response = await fetch(submitUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(routeStateToken ? { authorization: `Bearer ${routeStateToken}` } : {})
+    },
+    body: JSON.stringify({
+      request: admission.observation.request,
+      requestSignature: admission.requestSignature,
+      observation: admission.observation,
+      observationSignature: admission.signature
+    })
+  });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`upstream admission submit failed: ${response.status} ${body}`);
   }
 }
 
@@ -1430,6 +1690,13 @@ function freshUpstreamAdmissions(nowMs = Date.now()): StoredGatewayUpstreamAdmis
   return fresh;
 }
 
+function freshUpstreamAdmissionForRequestDigest(requestDigest: string, nowMs = Date.now()): StoredGatewayUpstreamAdmission | undefined {
+  const normalizedDigest = requestDigest.toLowerCase();
+  return freshUpstreamAdmissions(nowMs).find((admission) =>
+    admission.observation.requestDigest.toLowerCase() === normalizedDigest
+  );
+}
+
 function pruneUpstreamAdmissionNonces(nowMs = Date.now()): void {
   for (const [nonceKey, expiresAtMs] of upstreamAdmissionNonces.entries()) {
     if (expiresAtMs <= nowMs) {
@@ -1456,6 +1723,15 @@ function normalizeObservedIp(value: string | undefined): string | undefined {
   }
   const normalized = value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value;
   return isIP(normalized) === 4 ? normalized : undefined;
+}
+
+function gatewayUpstreamAdmissionMatchesThisGateway(request: GatewayUpstreamAdmissionPayload): boolean {
+  return Boolean(
+    operatorId &&
+    gatewayId &&
+    request.operatorId.toLowerCase() === operatorId.toLowerCase() &&
+    request.gatewayId === gatewayId
+  );
 }
 
 function observedIpAllowed(value: string): boolean {
@@ -1517,6 +1793,112 @@ function ipv4Octets(value: string): [number, number, number, number] | undefined
     return undefined;
   }
   return octets as [number, number, number, number];
+}
+
+async function verifyRuntimeUpstreamProbe(
+  request: GatewayUpstreamAdmissionPayload,
+  requestDigest: string,
+  observedIp: string
+): Promise<void> {
+  const gatewayNonce = randomBytes(16).toString("hex");
+  const responseBody = objectRecord(
+    await postRuntimeUpstreamProbe(request, requestDigest, gatewayNonce, observedIp),
+    "upstream admission probe response"
+  );
+  if (responseBody.ok !== true) {
+    throw new GatewayUpstreamAdmissionError(
+      422,
+      "upstream_probe_rejected",
+      typeof responseBody.error === "string" ? responseBody.error : "runtime rejected upstream probe"
+    );
+  }
+  const probe = normalizeGatewayUpstreamProbeResponsePayload(
+    objectRecord(responseBody.probe, "upstream admission probe payload") as unknown as Parameters<typeof normalizeGatewayUpstreamProbeResponsePayload>[0]
+  );
+  const signature = stringField(responseBody, "signature");
+  if (probe.requestDigest.toLowerCase() !== requestDigest.toLowerCase()) {
+    throw new GatewayUpstreamAdmissionError(422, "upstream_probe_digest_mismatch", "runtime probe requestDigest mismatch");
+  }
+  if (probe.gatewayNonce !== gatewayNonce) {
+    throw new GatewayUpstreamAdmissionError(422, "upstream_probe_nonce_mismatch", "runtime probe nonce mismatch");
+  }
+  if (probe.intentId !== request.intentId || probe.sessionId.toLowerCase() !== request.sessionId.toLowerCase()) {
+    throw new GatewayUpstreamAdmissionError(422, "upstream_probe_context_mismatch", "runtime probe context mismatch");
+  }
+  if (probe.upstreamPort !== request.upstreamPort) {
+    throw new GatewayUpstreamAdmissionError(422, "upstream_probe_port_mismatch", "runtime probe upstreamPort mismatch");
+  }
+  const signer = recoverGatewayUpstreamProbeResponseSigner(probe, signature);
+  if (signer.toLowerCase() !== request.runtimeSigner.toLowerCase()) {
+    throw new GatewayUpstreamAdmissionError(422, "upstream_probe_signature_mismatch", "runtime probe signature signer mismatch");
+  }
+}
+
+async function postRuntimeUpstreamProbe(
+  request: GatewayUpstreamAdmissionPayload,
+  requestDigest: string,
+  gatewayNonce: string,
+  observedIp: string
+): Promise<unknown> {
+  const ca = upstreamAdmissionCaFile ? await fs.readFile(upstreamAdmissionCaFile, "utf8") : undefined;
+  const servername = request.validationHostname ?? request.hostname;
+  const payload = JSON.stringify({
+    request,
+    requestDigest,
+    gatewayNonce
+  });
+  return new Promise((resolve, reject) => {
+    const probeRequest = https.request({
+      hostname: observedIp,
+      port: request.upstreamPort,
+      method: "POST",
+      path: SWITCHBOARD_UPSTREAM_ADMISSION_PATH,
+      servername,
+      ca,
+      rejectUnauthorized: upstreamAdmissionTlsProbeEnabled,
+      timeout: upstreamAdmissionTlsProbeTimeoutMs,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload).toString(),
+        host: servername
+      }
+    }, (response) => {
+      let raw = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        raw += chunk;
+        if (raw.length > 64_000) {
+          probeRequest.destroy(new Error("upstream probe response exceeded 64KB"));
+        }
+      });
+      response.on("end", () => {
+        if ((response.statusCode ?? 0) < 200 || (response.statusCode ?? 0) >= 300) {
+          reject(new GatewayUpstreamAdmissionError(422, "upstream_probe_failed", `runtime probe failed: ${response.statusCode} ${raw}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw));
+        } catch (error) {
+          reject(new GatewayUpstreamAdmissionError(
+            422,
+            "upstream_probe_invalid_json",
+            error instanceof Error ? error.message : String(error)
+          ));
+        }
+      });
+    });
+    probeRequest.once("timeout", () => {
+      probeRequest.destroy(new GatewayUpstreamAdmissionError(504, "upstream_probe_timeout", "runtime upstream probe timed out"));
+    });
+    probeRequest.once("error", (error) => {
+      reject(error instanceof GatewayUpstreamAdmissionError
+        ? error
+        : new GatewayUpstreamAdmissionError(422, "upstream_probe_failed", error.message));
+    });
+    probeRequest.write(payload);
+    probeRequest.end();
+  });
 }
 
 async function verifyUpstreamTls(
@@ -1597,6 +1979,18 @@ function numberRecordField(input: Record<string, unknown>, name: string): number
     throw new Error(`${name} must be an integer`);
   }
   return value;
+}
+
+function normalizeCandidateUpstreamIps(input: unknown): string[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+  return uniqueStrings(
+    input
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => isIP(value) === 4)
+  );
 }
 
 function splitCsv(value: string): string[] {

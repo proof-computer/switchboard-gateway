@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { createServer, type Server as NetServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { promisify } from "node:util";
 import { ethers } from "ethers";
 
 import {
   gatewayUpstreamAdmissionDigest,
+  gatewayUpstreamProbeResponseDigest,
+  normalizeGatewayUpstreamProbeResponsePayload,
   type GatewayUpstreamAdmissionPayload
 } from "../src/gateway-upstream-admission.js";
 
@@ -17,11 +21,14 @@ const OPERATOR_ID = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const GATEWAY_ID = "switchboard-az-02";
 const ROUTE_STATE_TOKEN = "route-state-token";
 const GATEWAY_REPORT_PRIVATE_KEY = "0x000000000000000000000000000000000000000000000000000000000000000a";
+type NodeHttpServer = HttpServer | HttpsServer;
 
 let child: ChildProcessWithoutNullStreams | undefined;
 let routeStateServer: HttpServer | undefined;
+let runtimeHttpsServer: HttpsServer | undefined;
 let hungRpcServer: NetServer | undefined;
 const hungRpcSockets = new Set<Socket>();
+const execFile = promisify(execFileCallback);
 
 describe("gateway route-state polling", () => {
   afterEach(async () => {
@@ -32,6 +39,10 @@ describe("gateway route-state polling", () => {
     if (routeStateServer) {
       await closeHttp(routeStateServer);
       routeStateServer = undefined;
+    }
+    if (runtimeHttpsServer) {
+      await closeHttp(runtimeHttpsServer);
+      runtimeHttpsServer = undefined;
     }
     if (hungRpcServer) {
       await closeNet(hungRpcServer);
@@ -369,6 +380,158 @@ describe("gateway route-state polling", () => {
     assert.notEqual(rendered[0]?.upstreamHost, "169.254.169.254");
   });
 
+  it("pulls pending upstream admission requests, probes the runtime, submits admission, and installs the route", async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), "switchboard-route-state-pull-admission-"));
+    const xdsDir = path.join(tempDir, "xds");
+    const stateFile = path.join(tempDir, "route-intents.json");
+    const runtimeWallet = new ethers.Wallet("0x000000000000000000000000000000000000000000000000000000000000000c");
+    const runtimePort = await freePort();
+    const cert = await createSelfSignedCertificate(tempDir, "admission.example.test");
+    const requestPayload: GatewayUpstreamAdmissionPayload = {
+      intentId: "di_gateway_relay_pull_admission_test",
+      sessionId: "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      runtimeSigner: runtimeWallet.address,
+      operatorId: OPERATOR_ID,
+      gatewayId: GATEWAY_ID,
+      processorId: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      hostname: "admission.example.test",
+      validationHostname: "admission.example.test",
+      upstreamPort: runtimePort,
+      nonce: `pull-nonce-${Date.now()}`,
+      deadline: String(Math.floor(Date.now() / 1000) + 600)
+    };
+    const requestDigest = gatewayUpstreamAdmissionDigest(requestPayload);
+    const requestSignature = runtimeWallet.signingKey.sign(requestDigest).serialized;
+    let probeCount = 0;
+    runtimeHttpsServer = createHttpsServer(cert, async (request, response) => {
+      if (request.method === "POST" && request.url === "/.well-known/proofcomputer/upstream-admission") {
+        probeCount += 1;
+        const body = await readJsonRequest(request);
+        const probe = normalizeGatewayUpstreamProbeResponsePayload({
+          version: 1,
+          kind: "switchboard.gateway-upstream-probe-response",
+          requestDigest: String(body.requestDigest),
+          gatewayNonce: String(body.gatewayNonce),
+          intentId: requestPayload.intentId,
+          sessionId: requestPayload.sessionId,
+          runtimeSigner: runtimeWallet.address,
+          upstreamPort: requestPayload.upstreamPort,
+          signedAt: new Date().toISOString()
+        });
+        jsonHttpResponse(response, 200, {
+          ok: true,
+          probe,
+          signature: runtimeWallet.signingKey.sign(gatewayUpstreamProbeResponseDigest(probe)).serialized
+        });
+        return;
+      }
+      jsonHttpResponse(response, 404, { error: "not_found" });
+    });
+    await listenHttp(runtimeHttpsServer, runtimePort);
+
+    const baseRoute = {
+      routeId: "pull-admission-route-1",
+      sessionId: requestPayload.sessionId,
+      hostname: requestPayload.hostname,
+      publicHostname: requestPayload.hostname,
+      validationHostname: requestPayload.validationHostname,
+      hostnameRole: "ha_public",
+      upstreamHost: "169.254.169.254",
+      upstreamPort: requestPayload.upstreamPort,
+      expiresAt: Math.floor(Date.now() / 1000) + 600,
+      source: {
+        mode: "deployment-intent-route-reconciler",
+        operatorId: OPERATOR_ID,
+        gatewayId: GATEWAY_ID,
+        processorId: requestPayload.processorId
+      }
+    };
+    let acceptedAdmission: Record<string, any> | undefined;
+    let submittedAdmission: Record<string, any> | undefined;
+    routeStateServer = createHttpServer(async (request, response) => {
+      if (request.method === "GET" && request.url === "/route-state") {
+        const routes = acceptedAdmission
+          ? [{
+              ...baseRoute,
+              source: {
+                ...baseRoute.source,
+                upstreamAdmissionId: acceptedAdmission.observation.admissionId
+              }
+            }]
+          : [];
+        jsonHttpResponse(response, 200, {
+          ok: true,
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          operatorId: OPERATOR_ID,
+          gatewayId: GATEWAY_ID,
+          routes,
+          activeRoutes: routes,
+          upstreamAdmissionRequests: acceptedAdmission ? [] : [{
+            requestDigest,
+            request: requestPayload,
+            requestSignature,
+            candidateUpstreamIps: ["127.0.0.1"]
+          }],
+          acceptedUpstreamAdmissions: acceptedAdmission ? [acceptedAdmission] : [],
+          routeCount: routes.length
+        });
+        return;
+      }
+      if (request.method === "POST" && request.url === `/v1/operators/${OPERATOR_ID}/gateways/${GATEWAY_ID}/upstream-admissions`) {
+        submittedAdmission = await readJsonRequest(request);
+        acceptedAdmission = submittedAdmission;
+        jsonHttpResponse(response, 200, { ok: true });
+        return;
+      }
+      jsonHttpResponse(response, 404, { error: "not_found" });
+    });
+    await listenHttp(routeStateServer);
+    const routeStateAddress = routeStateServer.address();
+    assert(routeStateAddress && typeof routeStateAddress !== "string");
+
+    const gatewayPort = await freePort();
+    child = spawn(process.execPath, ["--import", "tsx", "src/gateway-agent.ts"], {
+      cwd: path.resolve(import.meta.dirname, ".."),
+      env: {
+        ...process.env,
+        GATEWAY_AGENT_HOST: "127.0.0.1",
+        GATEWAY_AGENT_PORT: String(gatewayPort),
+        ENVOY_XDS_DIR: xdsDir,
+        ROUTE_INTENT_STATE_FILE: stateFile,
+        OPERATOR_ID,
+        GATEWAY_ID,
+        OPERATOR_REPORT_PRIVATE_KEY: GATEWAY_REPORT_PRIVATE_KEY,
+        OPERATOR_PUBLIC_ADDRESS_MODE: "static",
+        OPERATOR_PROCESSOR_DISCOVERY_ENABLED: "false",
+        GATEWAY_ROUTE_STATE_URL: `http://127.0.0.1:${routeStateAddress.port}/route-state`,
+        GATEWAY_ROUTE_STATE_TOKEN: ROUTE_STATE_TOKEN,
+        GATEWAY_ROUTE_STATE_POLL_INTERVAL_MS: "100",
+        GATEWAY_ROUTE_STATE_TIMEOUT_MS: "3000",
+        GATEWAY_ROUTE_STATE_WATCHDOG_MS: "5000",
+        GATEWAY_ROUTE_STATE_REMOVAL_GRACE_MS: "300",
+        GATEWAY_UPSTREAM_ADMISSION_ALLOWED_CIDRS: "127.0.0.1/32",
+        GATEWAY_UPSTREAM_ADMISSION_TLS_PROBE_ENABLED: "false",
+        ROUTE_EXPIRY_SWEEP_MS: "1000"
+      }
+    });
+    const output = collectChildOutput(child);
+
+    await waitFor(async () => {
+      const rendered = await readRenderedRoutes(xdsDir);
+      return rendered.length === 1 && rendered[0]?.upstreamHost === "127.0.0.1";
+    }, 45_000, output);
+
+    assert.equal(probeCount >= 1, true);
+    assert.equal(submittedAdmission?.requestSignature, requestSignature);
+    assert.equal(submittedAdmission?.observation.requestDigest, requestDigest);
+    assert.equal(submittedAdmission?.observation.observedIp, "127.0.0.1");
+    assert.equal(submittedAdmission?.observation.tls.skipped, true);
+    const rendered = await readRenderedRoutes(xdsDir);
+    assert.equal(rendered[0]?.upstreamHost, "127.0.0.1");
+    assert.notEqual(rendered[0]?.upstreamHost, "169.254.169.254");
+  });
+
   it("times out stale processor discovery and clears in-flight health", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "switchboard-processor-discovery-watchdog-"));
     const xdsDir = path.join(tempDir, "xds");
@@ -456,15 +619,53 @@ function jsonHttpResponse(response: ServerResponse, statusCode: number, body: Re
   response.end(JSON.stringify(body));
 }
 
-function listenHttp(server: HttpServer): Promise<void> {
+async function readJsonRequest(request: IncomingMessage): Promise<Record<string, any>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  return text ? JSON.parse(text) : {};
+}
+
+async function createSelfSignedCertificate(
+  tempDir: string,
+  hostname: string
+): Promise<{ key: string; cert: string }> {
+  const keyPath = path.join(tempDir, "runtime-probe.key");
+  const certPath = path.join(tempDir, "runtime-probe.crt");
+  await execFile("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-nodes",
+    "-subj",
+    `/CN=${hostname}`,
+    "-addext",
+    `subjectAltName=DNS:${hostname}`,
+    "-days",
+    "1",
+    "-keyout",
+    keyPath,
+    "-out",
+    certPath
+  ]);
+  return {
+    key: await readFile(keyPath, "utf8"),
+    cert: await readFile(certPath, "utf8")
+  };
+}
+
+function listenHttp(server: NodeHttpServer, port = 0): Promise<void> {
   return new Promise((resolve, reject) => {
-    server.listen(0, "127.0.0.1");
+    server.listen(port, "127.0.0.1");
     server.once("listening", resolve);
     server.once("error", reject);
   });
 }
 
-function closeHttp(server: HttpServer): Promise<void> {
+function closeHttp(server: NodeHttpServer): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => {
       if (error) {
