@@ -21,7 +21,12 @@ import { collectEnvoyRouteMetrics } from "./route-metrics.js";
 import { buildRouteStatusReport, type RouteStatusReportFilters } from "./route-status-report.js";
 import { signReportPayload, verifyReportSignature } from "./report-signing.js";
 import { renderFileXds } from "./xds.js";
-import { processorRefToId, signGatewayCapabilityReport, type GatewayCapabilityReport } from "./operator-capability.js";
+import {
+  gatewayCapabilityReportId,
+  processorRefToId,
+  signGatewayCapabilityReport,
+  type GatewayCapabilityReport
+} from "./operator-capability.js";
 import { fetchWanIpv4, normalizeOperatorPublicAddressMode, type OperatorPublicAddressMode } from "./wan-ip.js";
 import {
   GATEWAY_UPSTREAM_OBSERVATION_DOMAIN,
@@ -599,11 +604,10 @@ async function buildSignedGatewayCapabilityReport() {
   const routeMetrics = await gatewayRouteMetricsForReport();
 
   const now = new Date();
-  const nowUnixSeconds = Math.floor(now.getTime() / 1000);
   const report: GatewayCapabilityReport = {
     version: 1,
     kind: "switchboard.operator.capability",
-    reportId: `gateway-capability-${nowUnixSeconds}-${configVersion}`,
+    reportId: gatewayCapabilityReportId({ gatewayId, reportedAt: now, configVersion }),
     reportedAt: now.toISOString(),
     expiresAt: new Date(now.getTime() + capabilityReportTtlSeconds * 1000).toISOString(),
     operator: {

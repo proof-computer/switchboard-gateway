@@ -1,5 +1,6 @@
 import { decodeAddress } from "@polkadot/util-crypto";
 import { ethers } from "ethers";
+import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import { z } from "zod";
 
@@ -17,6 +18,25 @@ const ACCEPTED_OPERATOR_CAPABILITY_REPORT_DOMAINS = [
   OPERATOR_CAPABILITY_REPORT_DOMAIN,
   LEGACY_OPERATOR_CAPABILITY_REPORT_DOMAIN
 ] as const;
+
+export function gatewayCapabilityReportId(input: {
+  gatewayId: string;
+  reportedAt: Date;
+  configVersion: string | number;
+}): string {
+  const nowUnixSeconds = Math.floor(input.reportedAt.getTime() / 1000);
+  const gatewayComponent = input.gatewayId.trim().replace(/[^a-zA-Z0-9_.:-]+/g, "-") || "gateway";
+  const configComponent = (String(input.configVersion).trim().replace(/[^a-zA-Z0-9_.:-]+/g, "-") || "0").slice(0, 32);
+  const reportId = `gateway-capability-${gatewayComponent}-${nowUnixSeconds}-${configComponent}`;
+  if (reportId.length <= 160) {
+    return reportId;
+  }
+  const digest = createHash("sha256").update(input.gatewayId).digest("hex").slice(0, 16);
+  const suffix = `${digest}-${nowUnixSeconds}-${configComponent}`;
+  const prefix = "gateway-capability-";
+  const maxGatewayLength = Math.max(1, 160 - prefix.length - suffix.length - 1);
+  return `${prefix}${gatewayComponent.slice(0, maxGatewayLength)}-${suffix}`;
+}
 
 const hex32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/);
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/);

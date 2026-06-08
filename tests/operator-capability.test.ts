@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   OPERATOR_CAPABILITY_REPORT_DOMAIN,
+  gatewayCapabilityReportId,
   normalizeGatewayCapabilityReport,
   operatorCapabilityRouteIntentUrl,
   parseOperatorProfiles,
@@ -77,6 +78,28 @@ async function signedStoredReport(report: GatewayCapabilityReport = sampleReport
 }
 
 describe("operator capability signer authorization", () => {
+  it("scopes generated gateway capability report ids by gateway", () => {
+    const reportedAt = new Date("2026-06-08T14:13:39.000Z");
+
+    assert.equal(
+      gatewayCapabilityReportId({ gatewayId: "switchboard-az-02", reportedAt, configVersion: "24" }),
+      "gateway-capability-switchboard-az-02-1780928019-24"
+    );
+    assert.equal(
+      gatewayCapabilityReportId({ gatewayId: "switchboard-az-03", reportedAt, configVersion: "24" }),
+      "gateway-capability-switchboard-az-03-1780928019-24"
+    );
+
+    const longReportId = gatewayCapabilityReportId({
+      gatewayId: `gateway-${"very-long-".repeat(20)}az-03`,
+      reportedAt,
+      configVersion: "24"
+    });
+    assert.equal(longReportId.length <= 160, true);
+    assert.match(longReportId, /^gateway-capability-gateway-very-long-/);
+    assert.match(longReportId, /-1780928019-24$/);
+  });
+
   it("rejects active operator profiles without explicit report signers", () => {
     assert.throws(
       () => parseOperatorProfiles([{ operatorId: OPERATOR_ID }]),
