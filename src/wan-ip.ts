@@ -1,4 +1,3 @@
-import { lookup } from "node:dns";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
@@ -49,11 +48,9 @@ async function requestTextIpv4Only(urlValue: string, timeoutMs: number): Promise
     const req = request(
       url,
       {
+        family: 4,
         headers: {
           "user-agent": "switchboard-gateway-agent/1"
-        },
-        lookup(hostname, options, callback) {
-          lookup(hostname, { ...options, family: 4, all: false }, callback);
         }
       },
       (response) => {
