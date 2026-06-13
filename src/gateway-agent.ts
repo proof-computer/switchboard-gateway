@@ -19,7 +19,13 @@ import {
 import { normalizeHostname, normalizeRouteIntent, routeHostnames, routeIsActive, type RouteIntent } from "./route-intent.js";
 import { collectEnvoyRouteMetrics } from "./route-metrics.js";
 import { buildRouteStatusReport, type RouteStatusReportFilters } from "./route-status-report.js";
+import {
+  connectParachain,
+  deriveGatewayObservations,
+  publishGatewayObservations
+} from "./parachain-observations.js";
 import { signReportPayload, verifyReportSignature } from "./report-signing.js";
+import type { ApiPromise } from "@polkadot/api";
 import { renderFileXds } from "./xds.js";
 import {
   gatewayCapabilityReportId,
@@ -66,6 +72,22 @@ const capabilityReportUrl = process.env.PROOF_OPERATOR_CAPABILITY_URL;
 const capabilityReportToken = process.env.PROOF_OPERATOR_CAPABILITY_TOKEN;
 const capabilityReportIntervalMs = numberEnv("OPERATOR_CAPABILITY_REPORT_INTERVAL_MS", 60_000);
 const capabilityReportTtlSeconds = numberEnv("OPERATOR_CAPABILITY_REPORT_TTL_SECONDS", 180);
+// PROOF Ingress parachain gateway observations. The gateway signs Serving/Stopped
+// acks for its bound route generations with its sr25519 operational key
+// (OPERATOR_REPORT_SEED). Off by default; enabled when a parachain endpoint and a
+// numeric on-chain gateway id are configured.
+const proofIngressWsUrl = optionalStringEnv("PROOF_INGRESS_WS_URL");
+const proofIngressGatewayId = optionalNumberEnv("PROOF_INGRESS_GATEWAY_ID");
+const proofIngressObservationIntervalMs = numberEnv("PROOF_INGRESS_OBSERVATION_INTERVAL_MS", 60_000);
+const proofIngressObservationBatchMax = numberEnv("PROOF_INGRESS_OBSERVATION_BATCH_MAX", 256);
+const proofIngressVerifyBindings = boolEnv("PROOF_INGRESS_OBSERVATION_VERIFY_BINDINGS", true);
+const proofIngressEnabled =
+  Boolean(proofIngressWsUrl) &&
+  reportSigningScheme === "substrate-sr25519" &&
+  Boolean(reportSigningKey) &&
+  proofIngressGatewayId !== undefined;
+let proofIngressApi: ApiPromise | null = null;
+let proofIngressConnecting: Promise<ApiPromise> | null = null;
 const routeIntentToken = process.env.GATEWAY_AGENT_ROUTE_INTENT_TOKEN;
 const routeStateUrl = optionalStringEnv("GATEWAY_ROUTE_STATE_URL");
 const routeStateToken = process.env.GATEWAY_ROUTE_STATE_TOKEN ?? process.env.PROOF_OPERATOR_CAPABILITY_TOKEN;
@@ -541,6 +563,13 @@ if (routeStateUrl) {
   void pollRouteState();
 }
 
+if (proofIngressEnabled) {
+  setInterval(() => {
+    void publishProofIngressObservations();
+  }, proofIngressObservationIntervalMs).unref();
+  void publishProofIngressObservations();
+}
+
 if (publicAddressMode === "auto") {
   setInterval(() => {
     void refreshPublicAddress();
@@ -556,6 +585,53 @@ if (processorDiscoveryEnabled && advertisedManagerIds.length > 0) {
 }
 
 await app.listen({ host, port });
+
+async function proofIngressConnection(): Promise<ApiPromise> {
+  if (proofIngressApi && proofIngressApi.isConnected) {
+    return proofIngressApi;
+  }
+  if (!proofIngressConnecting) {
+    proofIngressConnecting = connectParachain(proofIngressWsUrl!)
+      .then((api) => {
+        proofIngressApi = api;
+        return api;
+      })
+      .finally(() => {
+        proofIngressConnecting = null;
+      });
+  }
+  return proofIngressConnecting;
+}
+
+async function publishProofIngressObservations(): Promise<void> {
+  try {
+    const observations = deriveGatewayObservations([...routes.values()], proofIngressGatewayId!);
+    if (observations.length === 0) {
+      return;
+    }
+    const api = await proofIngressConnection();
+    const result = await publishGatewayObservations({
+      api,
+      signingKey: reportSigningKey!,
+      ss58Format: reportSigningSs58Format,
+      gatewayId: proofIngressGatewayId!,
+      observations,
+      batchMax: proofIngressObservationBatchMax,
+      verifyBindings: proofIngressVerifyBindings
+    });
+    if (result.submitted > 0) {
+      app.log.info(
+        { gatewayId: proofIngressGatewayId, submitted: result.submitted, batches: result.batches },
+        "gateway observations submitted to parachain"
+      );
+    }
+  } catch (error) {
+    app.log.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      "gateway observation submission failed"
+    );
+  }
+}
 
 async function submitGatewayCapabilityReport(): Promise<void> {
   try {
