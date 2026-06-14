@@ -17,9 +17,12 @@
     "verify:public-surface": "node scripts/verify-public-surface.mjs",
     "gateway:agent": "node dist/gateway-agent.js",
     "gateway:hub-watcher": "node dist/hub-watcher.js",
+    "gateway:parachain-watcher": "node dist/parachain-watcher.js",
     "operator:gateway-agent": "npm run gateway:agent",
     "operator:hub-watcher": "npm run gateway:hub-watcher",
+    "operator:parachain-watcher": "npm run gateway:parachain-watcher",
     "dev:gateway-agent": "tsx src/gateway-agent.ts",
+    "dev:parachain-watcher": "tsx src/parachain-watcher.ts",
     "dev:hub-watcher": "tsx src/hub-watcher.ts"
   },
   "engines": {
